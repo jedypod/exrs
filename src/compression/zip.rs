@@ -42,5 +42,6 @@ pub fn compress_bytes(
     separate_bytes_fragments(&mut packed_le);
     samples_to_differences(&mut packed_le);
 
-    super::zlib_compress(&packed_le, 4)
+    // Level 3 writes about 10% faster than 4 for files about 1% larger.
+    super::zlib_compress(&packed_le, 3)
 }

@@ -449,6 +449,19 @@ impl Compression {
     }
 }
 
+/// Zlib-compress a block with zlib-rs, which deflates about twice as fast as miniz_oxide.
+fn zlib_compress(bytes: &[u8], level: i32) -> Result<ByteVec> {
+    let mut compressed = vec![0_u8; zlib_rs::compress_bound(bytes.len())];
+    let (written, status) =
+        zlib_rs::compress_slice(&mut compressed, bytes, zlib_rs::DeflateConfig::new(level));
+    if status != zlib_rs::ReturnCode::Ok {
+        return Err(Error::invalid("zlib compression failed"));
+    }
+    let length = written.len();
+    compressed.truncate(length);
+    Ok(compressed)
+}
+
 // see https://github.com/AcademySoftwareFoundation/openexr/blob/6a9f8af6e89547bcd370ae3cec2b12849eee0b54/OpenEXR/IlmImf/ImfMisc.cpp#L1456-L1541
 
 #[allow(unused)] // allows the extra parameters to be unused

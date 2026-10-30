@@ -3,7 +3,9 @@
 // Y'CbCr <-> R'G'B' color-space conversion the RGB triplets are transformed
 // with (the modified 709 coefficients from OpenEXRCore internal_dwa_simd.h).
 
-use half::{slice::HalfFloatSliceExt, f16};
+use std::cell::Cell;
+
+use half::{f16, slice::HalfFloatSliceExt};
 
 use super::{discrete_cosine_transform, ChannelInfo, CompressorScheme};
 use crate::{
@@ -16,7 +18,7 @@ mod quantization;
 mod transfer_curve;
 
 use quantization::{
-    from_half_zigzag, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
+    half_block_to_f32, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
 };
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
@@ -333,6 +335,10 @@ pub(super) fn decode_lossy_channels(
     Ok(samples)
 }
 
+thread_local! {
+    static DCT_BLOCKS: Cell<Vec<[[f32; 64]; 3]>> = const { Cell::new(Vec::new()) };
+}
+
 /// Decode one standalone channel (decoded.len() == 1) or one CSC'd R/G/B
 /// triplet (decoded.len() == 3): per 8x8 block and component, read the
 /// DC value, un-RLE the AC values, inverse-DCT
@@ -349,54 +355,54 @@ fn decode_lossy_dct_group(
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
 
-    // Buffer the whole group rather than one block at a time. That lets the
-    // inverse DCT batch over every block that actually needs it, matching the
-    // structure of the C reference.
-    let mut dct_blocks: Vec<[[f32; 64]; 3]> = vec![[[0.0f32; 64]; 3]; block_count];
-    let mut needs_inverse_dct: Vec<[bool; 3]> = vec![[false; 3]; block_count];
+    // Buffer one row of blocks at a time. That lets the inverse DCT batch over
+    // every block that actually needs it, matching the structure of the C
+    // reference, while the buffer still fits the L2 cache. Each chunk reuses
+    // it: allocating it anew per chunk costs more page faults than any other
+    // step of the decoder saves.
+    let mut dct_blocks = DCT_BLOCKS.take();
+    dct_blocks.resize(blocks_x, [[0.0f32; 64]; 3]);
+    let mut needs_inverse_dct: Vec<[bool; 3]> = vec![[false; 3]; blocks_x];
 
     for block_y in 0..blocks_y {
+        needs_inverse_dct.fill([false; 3]);
+
         for block_x in 0..blocks_x {
             let block_index = block_y * blocks_x + block_x;
 
             for component in 0..components {
-                let mut zig_block = [0u16; 64];
+                let mut half_block = [0u16; 64];
 
                 // the DC stream is planar: all of component 0's blocks,
                 // then all of component 1's, ...
-                zig_block[0] = dc
+                half_block[0] = dc
                     .peek_at(component * block_count + block_index)
                     .ok_or_else(|| Error::invalid("truncated DWA DC data"))?;
 
-                let last_non_zero = un_rle_ac(ac, &mut zig_block)?;
+                let last_non_zero = un_rle_ac(ac, &mut half_block)?;
 
-                let dct_block = &mut dct_blocks[block_index][component];
+                let dct_block = &mut dct_blocks[block_x][component];
                 if last_non_zero == 0 {
                     // DC-only block: all AC coefficients are zero, so the
                     // inverse DCT can fill the whole block from one value.
-                    dct_block[0] = f16::from_bits(zig_block[0]).to_f32();
+                    dct_block[0] = f16::from_bits(half_block[0]).to_f32();
                     discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
                 } else {
-                    from_half_zigzag(&zig_block, dct_block);
-                    needs_inverse_dct[block_index][component] = true;
+                    half_block_to_f32(&half_block, dct_block);
+                    needs_inverse_dct[block_x][component] = true;
                 }
             }
         }
-    }
 
-    discrete_cosine_transform::dct_inverse_8x8_batch(
-        dct_blocks
-            .iter_mut()
-            .zip(needs_inverse_dct.iter())
-            .flat_map(|(blocks, flags)| blocks.iter_mut().zip(flags.iter()))
-            .filter_map(|(block, &needed)| needed.then_some(block)),
-    );
+        discrete_cosine_transform::dct_inverse_8x8_batch(
+            dct_blocks
+                .iter_mut()
+                .zip(needs_inverse_dct.iter())
+                .flat_map(|(blocks, flags)| blocks.iter_mut().zip(flags.iter()))
+                .filter_map(|(block, &needed)| needed.then_some(block)),
+        );
 
-    for block_y in 0..blocks_y {
-        for block_x in 0..blocks_x {
-            let block_index = block_y * blocks_x + block_x;
-            let dct_blocks = &mut dct_blocks[block_index];
-
+        for (block_x, dct_blocks) in dct_blocks.iter_mut().enumerate() {
             if components == 3 {
                 for i in 0..64 {
                     let (r, g, b) =
@@ -428,6 +434,7 @@ fn decode_lossy_dct_group(
         }
     }
 
+    DCT_BLOCKS.set(dct_blocks);
     dc.advance(components * block_count);
     Ok(())
 }

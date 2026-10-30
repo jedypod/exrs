@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 
-use half::{f16, slice::HalfFloatSliceExt};
+use half::f16;
 
 use super::{discrete_cosine_transform, ChannelInfo, CompressorScheme};
 use crate::{
@@ -13,12 +13,13 @@ use crate::{
     meta::attribute::SampleType,
 };
 
+mod half_blocks;
 mod half_float_quantizer;
 mod quantization;
 mod transfer_curve;
 
 use quantization::{
-    half_block_to_f32, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
+    quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
 };
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
@@ -388,7 +389,7 @@ fn decode_lossy_dct_group(
                     dct_block[0] = f16::from_bits(half_block[0]).to_f32();
                     discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
                 } else {
-                    half_block_to_f32(&half_block, dct_block);
+                    half_blocks::halves_to_f32(&half_block, dct_block);
                     needs_inverse_dct[block_x][component] = true;
                 }
             }
@@ -414,13 +415,12 @@ fn decode_lossy_dct_group(
             }
 
             // Convert nonlinear DCT output back to linear half values and crop
-            // the edges to the actual image extent. Half conversion is in bulk,
-            // which uses F16C where the CPU has it.
+            // the edges to the actual image extent.
             let (x0, y0) = (block_x * 8, block_y * 8);
             let block_width = (width - x0).min(8);
             for (component, output) in decoded.iter_mut().enumerate() {
                 let mut nonlinear = [f16::ZERO; 64];
-                nonlinear.convert_from_f32_slice(&dct_blocks[component]);
+                half_blocks::f32_to_halves(&dct_blocks[component], &mut nonlinear);
                 if let Some(to_linear) = to_linear {
                     for value in &mut nonlinear {
                         *value = f16::from_bits(to_linear[value.to_bits() as usize]);

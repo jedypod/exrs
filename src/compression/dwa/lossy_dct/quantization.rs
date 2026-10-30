@@ -4,10 +4,7 @@
 // and gather (`ZIG_ZAG_TO_RASTER`) permutations are exact inverses of each
 // other.
 
-use half::{
-    slice::{HalfBitsSliceExt, HalfFloatSliceExt},
-    f16,
-};
+use half::f16;
 
 use super::{half_float_quantizer::algo_quantize, PackedStream};
 use crate::error::{Error, Result};
@@ -145,13 +142,6 @@ pub(super) fn un_rle_ac(ac: &mut PackedStream<'_>, block: &mut [u16; 64]) -> Res
     }
 
     Ok(last_non_zero)
-}
-
-/// Convert a raster-order block of half bits to f32.
-pub(super) fn half_block_to_f32(block: &[u16; 64], dst: &mut [f32; 64]) {
-    // Convert in bulk, which uses F16C where the CPU has it; converting
-    // sample by sample is several times slower.
-    block.reinterpret_cast::<f16>().convert_to_f32_slice(dst);
 }
 
 /// Where each zig-zag position goes in an 8x8 raster block

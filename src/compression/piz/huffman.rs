@@ -112,10 +112,12 @@ struct DecodingTable {
 /// OpenEXR's `FastHufDecoder`. Canonical codes of one length are consecutive,
 /// and left-aligned in 64 bits, every code compares greater than all longer
 /// codes. So the length of the code at the start of the input is the shortest
-/// whose first left-aligned code is not greater than the input bits.
+/// that has codes and whose first left-aligned code is not greater than the
+/// input bits.
 struct LongCodes {
-    /// The first code of each length, left-aligned; `u64::MAX` for lengths
-    /// without codes, so that they never match.
+    /// The lengths that have codes, ascending.
+    lengths: Vec<u64>,
+    /// The first code of each length, left-aligned.
     first_left_aligned: [u64; 59],
     /// The first code of each length.
     first: [u64; 59],
@@ -132,8 +134,10 @@ impl LongCodes {
     /// must hold at least `max_length` valid bits.
     #[inline]
     fn decode(&self, bits: u64) -> Option<(u32, u64)> {
-        let length = (DECODE_BITS + 1..=self.max_length)
-            .find(|&length| bits >= self.first_left_aligned[length as usize])?;
+        let length = *self
+            .lengths
+            .iter()
+            .find(|&&length| bits >= self.first_left_aligned[length as usize])?;
         let index = (bits >> (64 - length)) - self.first[length as usize];
         (index < u64::from(self.count[length as usize])).then(|| {
             let symbol = self.symbols[(self.offset[length as usize] + index as u32) as usize];
@@ -333,7 +337,8 @@ fn build_decoding_table(
 ) -> Result<DecodingTable> {
     let mut entries = Box::new([0_u32; DECODING_TABLE_SIZE]);
     let mut long = LongCodes {
-        first_left_aligned: [u64::MAX; 59],
+        lengths: Vec::new(),
+        first_left_aligned: [0; 59],
         first: [0; 59],
         offset: [0; 59],
         count: [0; 59],
@@ -377,6 +382,10 @@ fn build_decoding_table(
             entries[start_index..start_index + count].fill(entry);
         }
     }
+
+    long.lengths = (DECODE_BITS + 1..=long.max_length)
+        .filter(|&length| long.count[length as usize] != 0)
+        .collect();
 
     // Group the long-code symbols by length, keeping code order within each.
     let mut total = 0;
@@ -1079,6 +1088,25 @@ mod test {
 
             assert_eq!(uncompressed, raw);
         }
+    }
+
+    /// With no codes of `DECODE_BITS` bits or fewer, every code takes the
+    /// long path. Here every symbol has a 16-bit code, so lengths 13 to 15
+    /// have none, and symbol 65535's code is sixteen ones. Near the end of the
+    /// input the bit reader fills all 64 bits with them, so lengths without
+    /// codes must never match, even input bits of all ones.
+    #[test]
+    fn long_codes_after_unused_lengths_with_all_one_bits() {
+        let mut encoding_table = vec![0_u64; ENCODING_TABLE_SIZE];
+        encoding_table[..1 << 16].fill(16);
+        let symbols: Vec<u32> = (0..1 << 16).collect();
+        build_canonical_table(&mut encoding_table, 0..1 << 16).unwrap();
+        let decoding_table = build_decoding_table(&encoding_table, &symbols, 1 << 16).unwrap();
+
+        let input = [0xff_u8; 12];
+        let decoded = decode_with_tables(&decoding_table, &input, 6 * 16, 1 << 16, 6).unwrap();
+
+        assert_eq!(decoded, [u16::MAX; 6]);
     }
 
     #[test]

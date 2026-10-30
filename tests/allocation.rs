@@ -43,6 +43,22 @@ fn dwa_huge_ac_count_is_an_error() {
     assert!(result.is_err());
 }
 
+/// A DWA chunk header claims a zlib section of hundreds of terabytes; the
+/// decoder used to pass that size to the inflater, which reserved it up front.
+#[test]
+fn dwa_huge_zlib_section_is_an_error() {
+    let result = read()
+        .no_deep_data()
+        .largest_resolution_level()
+        .all_channels()
+        .all_layers()
+        .all_attributes()
+        .non_parallel()
+        .from_file("tests/images/fuzzed/dwa_zlib_huge_section_size.exr");
+
+    assert!(result.is_err());
+}
+
 /// Headers claiming 654 million lines, where the file ends before the offset
 /// table does. Only the file's own offsets tell it apart from a real image.
 #[test]

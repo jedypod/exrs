@@ -16,7 +16,7 @@ mod quantization;
 mod transfer_curve;
 
 use quantization::{
-    from_half_zigzag, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
+    half_block_to_f32, quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
 };
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
@@ -360,24 +360,24 @@ fn decode_lossy_dct_group(
             let block_index = block_y * blocks_x + block_x;
 
             for component in 0..components {
-                let mut zig_block = [0u16; 64];
+                let mut half_block = [0u16; 64];
 
                 // the DC stream is planar: all of component 0's blocks,
                 // then all of component 1's, ...
-                zig_block[0] = dc
+                half_block[0] = dc
                     .peek_at(component * block_count + block_index)
                     .ok_or_else(|| Error::invalid("truncated DWA DC data"))?;
 
-                let last_non_zero = un_rle_ac(ac, &mut zig_block)?;
+                let last_non_zero = un_rle_ac(ac, &mut half_block)?;
 
                 let dct_block = &mut dct_blocks[block_index][component];
                 if last_non_zero == 0 {
                     // DC-only block: all AC coefficients are zero, so the
                     // inverse DCT can fill the whole block from one value.
-                    dct_block[0] = f16::from_bits(zig_block[0]).to_f32();
+                    dct_block[0] = f16::from_bits(half_block[0]).to_f32();
                     discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
                 } else {
-                    from_half_zigzag(&zig_block, dct_block);
+                    half_block_to_f32(&half_block, dct_block);
                     needs_inverse_dct[block_index][component] = true;
                 }
             }
@@ -409,21 +409,19 @@ fn decode_lossy_dct_group(
 
             // Convert nonlinear DCT output back to linear half values and crop
             // the edges to the actual image extent.
+            let (x0, y0) = (block_x * 8, block_y * 8);
+            let block_width = (width - x0).min(8);
             for (component, output) in decoded.iter_mut().enumerate() {
-                let mut half_block = [f16::ZERO; 64];
-                half_block.convert_from_f32_slice(&dct_blocks[component]);
-                let columns = (width - block_x * 8).min(8);
-                for y in block_y * 8..(block_y * 8 + 8).min(height) {
-                    let row = &half_block[(y - block_y * 8) * 8..][..columns];
-                    let output_row = &mut output[y * width + block_x * 8..][..columns];
-                    match to_linear {
-                        Some(table) => {
-                            for (output, nonlinear) in output_row.iter_mut().zip(row) {
-                                *output = f16::from_bits(table[nonlinear.to_bits() as usize]);
-                            }
-                        }
-                        None => output_row.copy_from_slice(row),
+                let mut nonlinear = [f16::ZERO; 64];
+                nonlinear.convert_from_f32_slice(&dct_blocks[component]);
+                if let Some(to_linear) = to_linear {
+                    for value in &mut nonlinear {
+                        *value = f16::from_bits(to_linear[value.to_bits() as usize]);
                     }
+                }
+                for (row, y) in nonlinear.chunks_exact(8).zip(y0..height.min(y0 + 8)) {
+                    let start = y * width + x0;
+                    output[start..start + block_width].copy_from_slice(&row[..block_width]);
                 }
             }
         }

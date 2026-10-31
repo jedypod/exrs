@@ -3,6 +3,7 @@
 // planar byte planes of the UNKNOWN/RLE sections, and back again.
 
 use half::{f16, slice::HalfFloatSliceExt};
+use lebe::io::WriteEndian;
 
 use super::{ChannelInfo, CompressorScheme};
 use crate::{
@@ -218,9 +219,7 @@ pub(super) fn write_scanlines(
                     let row_samples = &lossy_samples[index][row * info.width..][..info.width];
                     match info.sample_type {
                         SampleType::F16 => {
-                            for sample in row_samples {
-                                out.extend_from_slice(&sample.to_bits().to_le_bytes());
-                            }
+                            out.write_as_little_endian(row_samples.reinterpret_cast())?;
                         }
                         SampleType::F32 => {
                             // Batch half conversions without allocating a
@@ -229,9 +228,7 @@ pub(super) fn write_scanlines(
                             for samples in row_samples.chunks(floats.len()) {
                                 let floats = &mut floats[..samples.len()];
                                 samples.convert_to_f32_slice(floats);
-                                for sample in floats {
-                                    out.extend_from_slice(&sample.to_le_bytes());
-                                }
+                                out.write_as_little_endian(&*floats)?;
                             }
                         }
                         // rejected before decoding

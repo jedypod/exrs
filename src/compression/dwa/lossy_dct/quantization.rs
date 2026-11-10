@@ -68,12 +68,23 @@ pub(super) fn quantize_coefficients_to_zigzag(
 
     let mut half_zig = [0u16; 64];
     for i in 0..64 {
-        let src = f16::from_f32(dct_values[i]).to_bits();
+        let src = f16::from_f32(dct_values[i]);
+        let src_float = src.to_f32();
+
+        // Most coefficients are smaller than their tolerance and quantize
+        // to zero, which `algo_quantize` decides before its search. Test
+        // that here instead of calling it. Infinities and NaN compare false
+        // and still go through `algo_quantize`, which returns them as they
+        // are.
+        if src_float.abs() < tolerances[i] {
+            continue;
+        }
+
         let quantized = algo_quantize(
-            src as u32,
+            src.to_bits() as u32,
             half_tolerances[i] as u32,
             tolerances[i],
-            f16::from_bits(src).to_f32(),
+            src_float,
         );
         half_zig[INV_REMAP[i]] = quantized as u16;
     }
@@ -183,6 +194,81 @@ mod test {
         // un_rle_ac places values in raster order
         let zig_zag = ZIG_ZAG_TO_RASTER.map(|raster| decoded[raster as usize]);
         assert_eq!(zig_zag, block);
+    }
+
+    /// The quantization as it was before skipping the search for
+    /// coefficients below their tolerance.
+    fn quantize_every_coefficient(
+        dct_values: &[f32; 64],
+        tolerances: &[f32; 64],
+        half_tolerances: &[u16; 64],
+    ) -> [u16; 64] {
+        const INV_REMAP: [usize; 64] = [
+            0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43,
+            9, 11, 18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51,
+            55, 60, 21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
+        ];
+
+        let mut half_zig = [0u16; 64];
+        for i in 0..64 {
+            let src = f16::from_f32(dct_values[i]).to_bits();
+            let quantized = algo_quantize(
+                src as u32,
+                half_tolerances[i] as u32,
+                tolerances[i],
+                f16::from_bits(src).to_f32(),
+            );
+            half_zig[INV_REMAP[i]] = quantized as u16;
+        }
+        half_zig
+    }
+
+    /// Every half value (both signs, subnormals, infinities and NaN) at
+    /// every position of both tables, for the default base error and a few
+    /// others, quantizes as before.
+    #[test]
+    fn skipping_small_coefficients_quantizes_as_before() {
+        for base_error in [0.0, 1e-6, 45.0 / 100_000.0, 0.01, 1.0, 1e6] {
+            let tables = QuantTables::new(base_error);
+            let tables = [(&tables.y, &tables.half_y), (&tables.cbcr, &tables.half_cbcr)];
+            for (tolerances, half_tolerances) in tables {
+                // Rotating the values through the block puts each one at
+                // every position.
+                for start in (0..=u16::MAX as usize).step_by(64) {
+                    for rotation in 0..64 {
+                        let block: [f32; 64] = std::array::from_fn(|i| {
+                            let bits = (start + (i + rotation) % 64) as u16;
+                            f16::from_bits(bits).to_f32()
+                        });
+                        assert_eq!(
+                            quantize_coefficients_to_zigzag(&block, tolerances, half_tolerances),
+                            quantize_every_coefficient(&block, tolerances, half_tolerances),
+                            "base error {base_error}, values from {start:#06x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Floats between halves round to them first, the same way on both
+    /// paths.
+    #[test]
+    fn skipping_small_coefficients_quantizes_random_floats_as_before() {
+        let mut random = rand::rngs::StdRng::from_seed(SEED);
+        let tables = QuantTables::new(45.0 / 100_000.0);
+        for _ in 0..20_000 {
+            let scale = 10f32.powi(random.gen_range(-8..4));
+            let block: [f32; 64] = std::array::from_fn(|_| random.gen_range(-1.0..1.0) * scale);
+            for (tolerances, half_tolerances) in
+                [(&tables.y, &tables.half_y), (&tables.cbcr, &tables.half_cbcr)]
+            {
+                assert_eq!(
+                    quantize_coefficients_to_zigzag(&block, tolerances, half_tolerances),
+                    quantize_every_coefficient(&block, tolerances, half_tolerances),
+                );
+            }
+        }
     }
 
     #[test]

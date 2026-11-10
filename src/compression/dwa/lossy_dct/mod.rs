@@ -181,15 +181,13 @@ fn encode_lossy_dct_group(
     for block_y in 0..blocks_y {
         for block_x in 0..blocks_x {
             for component_index in 0..component_count {
-                let block = &mut row_blocks[block_x][component_index];
-                for y in 0..8 {
-                    let src_y = mirror_index(block_y * 8 + y, height);
-                    for x in 0..8 {
-                        let src_x = mirror_index(block_x * 8 + x, width);
-                        let bits = components[component_index][src_y * width + src_x];
-                        block[y * 8 + x] = f16::from_bits(bits).to_f32();
-                    }
-                }
+                load_block(
+                    &components[component_index],
+                    width,
+                    height,
+                    (block_x, block_y),
+                    &mut row_blocks[block_x][component_index],
+                );
             }
 
             if component_count == 3 {
@@ -230,6 +228,36 @@ fn encode_lossy_dct_group(
     }
 
     Ok(())
+}
+
+/// Widen the 8x8 block at `(block_x, block_y)` of a `width` x `height`
+/// half component. Blocks inside the image copy whole rows; only those
+/// crossing its right or bottom edge mirror each coordinate.
+fn load_block(
+    component: &[u16],
+    width: usize,
+    height: usize,
+    (block_x, block_y): (usize, usize),
+    block: &mut [f32; 64],
+) {
+    let (x0, y0) = (block_x * 8, block_y * 8);
+    if x0 + 8 <= width && y0 + 8 <= height {
+        for (y, row) in block.chunks_exact_mut(8).enumerate() {
+            let start = (y0 + y) * width + x0;
+            for (value, &bits) in row.iter_mut().zip(&component[start..start + 8]) {
+                *value = f16::from_bits(bits).to_f32();
+            }
+        }
+        return;
+    }
+
+    for y in 0..8 {
+        let src_y = mirror_index(y0 + y, height);
+        for x in 0..8 {
+            let src_x = mirror_index(x0 + x, width);
+            block[y * 8 + x] = f16::from_bits(component[src_y * width + src_x]).to_f32();
+        }
+    }
 }
 
 fn mirror_index(index: usize, length: usize) -> usize {
@@ -443,6 +471,36 @@ mod test {
         66, 100, 19, 240, 8, 91, 3, 128, 9, 44, 201, 17, 88, 6, 255, 61, 30, 11, 2, 121, 99, 1,
         250, 77, 33, 7, 42, 13, 200, 176, 22, 5,
     ];
+
+    /// Every block of components of several sizes, including partial edge
+    /// blocks and images smaller than a block, loads as when mirroring each
+    /// coordinate.
+    #[test]
+    fn blocks_load_as_when_mirroring_every_sample() {
+        let mut random = rand::rngs::StdRng::from_seed(SEED);
+        for (width, height) in
+            [(1_usize, 1_usize), (3, 5), (8, 8), (13, 9), (16, 24), (17, 16), (31, 33)]
+        {
+            let component: Vec<u16> = (0..width * height).map(|_| random.gen()).collect();
+            for block_y in 0..height.div_ceil(8) {
+                for block_x in 0..width.div_ceil(8) {
+                    let mut block = [0.0; 64];
+                    load_block(&component, width, height, (block_x, block_y), &mut block);
+                    let expected: [f32; 64] = std::array::from_fn(|i| {
+                        let y = mirror_index(block_y * 8 + i / 8, height);
+                        let x = mirror_index(block_x * 8 + i % 8, width);
+                        f16::from_bits(component[y * width + x]).to_f32()
+                    });
+                    // NaN payloads compare by bits.
+                    assert_eq!(
+                        block.map(f32::to_bits),
+                        expected.map(f32::to_bits),
+                        "{width}x{height}, block {block_x}, {block_y}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The R'G'B' <-> Y'CbCr conversion pair must round-trip: converting to
     /// Y'CbCr and back must recover the original RGB triple (approximately,

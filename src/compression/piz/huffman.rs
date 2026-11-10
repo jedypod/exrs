@@ -7,7 +7,7 @@ use std::{
     cmp::Ordering,
     collections::BinaryHeap,
     convert::TryFrom,
-    io::{Cursor, Read, Write},
+    io::{Read, Write},
 };
 
 use crate::{
@@ -61,29 +61,31 @@ pub fn compress(uncompressed: &[u16]) -> Result<Vec<u8>> {
     let mut frequencies = count_frequencies(uncompressed);
     let (min_code_index, max_code_index) = build_encoding_table(&mut frequencies)?;
 
-    let mut result = Cursor::new(Vec::with_capacity(uncompressed.len()));
+    // Bytes are appended to a plain vector: writing one through a `Cursor`
+    // costs a position check and bookkeeping per byte.
+    let mut result = Vec::with_capacity(uncompressed.len());
     u32::write_slice_le(&mut result, &[0; 5])?; // we come back to these later
                                                 // after we know more about the
                                                 // compressed data
 
-    let table_start = result.position();
+    let table_start = result.len();
     pack_encoding_table(&frequencies, min_code_index, max_code_index, &mut result)?;
 
-    let data_start = result.position();
+    let data_start = result.len();
     let bit_count =
         encode_with_frequencies(&frequencies, uncompressed, max_code_index, &mut result)?;
 
     // write meta data after this
-    result.set_position(0);
     let table_length = data_start - table_start;
+    let mut header = &mut result[..5 * 4];
 
-    u32::try_from(min_code_index)?.write_le(&mut result)?;
-    u32::try_from(max_code_index)?.write_le(&mut result)?;
-    u32::try_from(table_length)?.write_le(&mut result)?;
-    u32::try_from(bit_count)?.write_le(&mut result)?;
-    0_u32.write_le(&mut result)?;
+    u32::try_from(min_code_index)?.write_le(&mut header)?;
+    u32::try_from(max_code_index)?.write_le(&mut header)?;
+    u32::try_from(table_length)?.write_le(&mut header)?;
+    u32::try_from(bit_count)?.write_le(&mut header)?;
+    0_u32.write_le(&mut header)?;
 
-    Ok(result.into_inner())
+    Ok(result)
 }
 
 const ENCODE_BITS: u64 = 16; // literal (value) bit length
@@ -558,7 +560,7 @@ fn encode_with_frequencies(
     frequencies: &[u64],
     uncompressed: &[u16],
     run_length_code: usize,
-    mut out: &mut Cursor<Vec<u8>>,
+    mut out: &mut Vec<u8>,
 ) -> Result<u64> {
     let mut code_bits = 0;
     let mut code_bit_count = 0;
@@ -566,7 +568,7 @@ fn encode_with_frequencies(
     let mut run_start_value = uncompressed[0];
     let mut run_length = 0;
 
-    let start_position = out.position();
+    let start_position = out.len() as u64;
 
     // Loop on input values
     for &current_value in &uncompressed[1..] {
@@ -599,8 +601,8 @@ fn encode_with_frequencies(
         &mut out,
     )?;
 
-    let data_length = out.position() - start_position; // we shouldn't count the
-                                                       // last byte write
+    let data_length = out.len() as u64 - start_position; // we shouldn't count the
+                                                         // last byte write
 
     if code_bit_count != 0 {
         out.write_all(&[(code_bits << (8 - code_bit_count) & 0xff) as u8])?;
@@ -626,7 +628,7 @@ fn pack_encoding_table(
     frequencies: &[u64],
     min_index: usize,
     max_index: usize,
-    mut out: &mut Cursor<Vec<u8>>,
+    mut out: &mut Vec<u8>,
 ) -> UnitResult {
     let mut code_bits = 0_u64;
     let mut code_bit_count = 0_u64;

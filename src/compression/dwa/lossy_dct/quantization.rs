@@ -66,10 +66,17 @@ pub(super) fn quantize_coefficients_to_zigzag(
         21, 34, 37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
     ];
 
+    // Narrow and widen the whole block at once (F16C where available).
+    let mut halves = [f16::ZERO; 64];
+    super::half_blocks::f32_to_halves(dct_values, &mut halves);
+    let bits = halves.map(f16::to_bits);
+    let mut src_floats = [0.0; 64];
+    super::half_blocks::halves_to_f32(&bits, &mut src_floats);
+
     let mut half_zig = [0u16; 64];
     for i in 0..64 {
-        let src = f16::from_f32(dct_values[i]);
-        let src_float = src.to_f32();
+        let src = halves[i];
+        let src_float = src_floats[i];
 
         // Most coefficients are smaller than their tolerance and quantize
         // to zero, which `algo_quantize` decides before its search. Test

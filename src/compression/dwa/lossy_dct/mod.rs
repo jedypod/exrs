@@ -16,9 +16,7 @@ mod half_float_quantizer;
 mod quantization;
 mod transfer_curve;
 
-use quantization::{
-    quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables,
-};
+use quantization::{quantize_coefficients_to_zigzag, rle_ac, un_rle_ac, QuantTables};
 use transfer_curve::{to_linear_table, to_nonlinear_table};
 
 /// Y'CbCr -> R'G'B' inverse conversion for DWA, using the modified 709
@@ -242,12 +240,12 @@ fn load_block(
 ) {
     let (x0, y0) = (block_x * 8, block_y * 8);
     if x0 + 8 <= width && y0 + 8 <= height {
-        for (y, row) in block.chunks_exact_mut(8).enumerate() {
+        let mut halves = [0u16; 64];
+        for (y, row) in halves.chunks_exact_mut(8).enumerate() {
             let start = (y0 + y) * width + x0;
-            for (value, &bits) in row.iter_mut().zip(&component[start..start + 8]) {
-                *value = f16::from_bits(bits).to_f32();
-            }
+            row.copy_from_slice(&component[start..start + 8]);
         }
+        half_blocks::halves_to_f32(&halves, block);
         return;
     }
 

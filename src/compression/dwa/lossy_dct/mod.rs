@@ -422,16 +422,18 @@ fn decode_lossy_dct_group(
     let blocks_y = (height + 7) / 8;
     let block_count = blocks_x * blocks_y;
 
-    // Buffer the whole group rather than one block at a time. That lets the
-    // inverse DCT batch over every block that actually needs it, matching the
-    // structure of the C reference.
+    // Buffer one row of blocks rather than one block at a time. That lets the
+    // inverse DCT batch over every block of the row that actually needs it,
+    // while the row stays small enough to remain in the cache between the
+    // passes over it: the blocks of a whole chunk do not.
     // Every block of every component is written before it is read, so the
-    // blocks of an earlier group need no clearing.
-    let dct_blocks = reused_slice_of(dct_blocks, block_count, [[0.0f32; 64]; 3]);
-    let needs_inverse_dct = reused_slice_of(needs_inverse_dct, block_count, [false; 3]);
-    needs_inverse_dct.fill([false; 3]);
+    // blocks of an earlier row need no clearing.
+    let dct_blocks = reused_slice_of(dct_blocks, blocks_x, [[0.0f32; 64]; 3]);
+    let needs_inverse_dct = reused_slice_of(needs_inverse_dct, blocks_x, [false; 3]);
 
     for block_y in 0..blocks_y {
+        needs_inverse_dct.fill([false; 3]);
+
         for block_x in 0..blocks_x {
             let block_index = block_y * blocks_x + block_x;
 
@@ -446,7 +448,7 @@ fn decode_lossy_dct_group(
 
                 let last_non_zero = un_rle_ac(ac, &mut half_block)?;
 
-                let dct_block = &mut dct_blocks[block_index][component];
+                let dct_block = &mut dct_blocks[block_x][component];
                 if last_non_zero == 0 {
                     // DC-only block: all AC coefficients are zero, so the
                     // inverse DCT can fill the whole block from one value.
@@ -454,24 +456,21 @@ fn decode_lossy_dct_group(
                     discrete_cosine_transform::dct_inverse_8x8_dc_only(dct_block);
                 } else {
                     half_blocks::halves_to_f32(&half_block, dct_block);
-                    needs_inverse_dct[block_index][component] = true;
+                    needs_inverse_dct[block_x][component] = true;
                 }
             }
         }
-    }
 
-    discrete_cosine_transform::dct_inverse_8x8_batch(
-        dct_blocks
-            .iter_mut()
-            .zip(needs_inverse_dct.iter())
-            .flat_map(|(blocks, flags)| blocks.iter_mut().zip(flags.iter()))
-            .filter_map(|(block, &needed)| needed.then_some(block)),
-    );
+        discrete_cosine_transform::dct_inverse_8x8_batch(
+            dct_blocks
+                .iter_mut()
+                .zip(needs_inverse_dct.iter())
+                .flat_map(|(blocks, flags)| blocks.iter_mut().zip(flags.iter()))
+                .filter_map(|(block, &needed)| needed.then_some(block)),
+        );
 
-    for block_y in 0..blocks_y {
         for block_x in 0..blocks_x {
-            let block_index = block_y * blocks_x + block_x;
-            let dct_blocks = &mut dct_blocks[block_index];
+            let dct_blocks = &mut dct_blocks[block_x];
 
             if components == 3 {
                 for i in 0..64 {

@@ -181,9 +181,8 @@ impl UncompressedBlock {
     /// `Header::max_block_byte_size` bytes fits any block of that layer.
     /// It is an error if the destination is too short.
     ///
-    /// All temporary memory is meant to be taken from `scratch`, so that no
-    /// memory is allocated once it has grown to fit the largest block.
-    /// Not all decoders use it yet: some still allocate.
+    /// No memory is allocated once `scratch` has grown to fit the largest
+    /// block, as all temporary memory is taken from it.
     pub fn decompress_chunk_into(
         chunk: ChunkRef<'_>,
         meta_data: &MetaData,

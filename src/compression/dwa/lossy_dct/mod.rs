@@ -7,6 +7,7 @@ use half::f16;
 
 use super::{discrete_cosine_transform, ChannelInfo, CompressorScheme};
 use crate::{
+    compression::{reused_slice, reused_slice_of},
     error::{Error, Result},
     meta::attribute::SampleType,
 };
@@ -307,28 +308,60 @@ impl<'v> PackedStream<'v> {
     }
 }
 
+/// The buffers of the lossy DCT decoder, kept to decode the next chunk
+/// without allocating them again.
+#[derive(Default)]
+pub(in crate::compression) struct DecodeScratch {
+    /// The decoded samples of each channel. Those of a channel that is not
+    /// LOSSY_DCT are left over from an earlier chunk.
+    pub(super) samples: Vec<Vec<f16>>,
+    grouped: Vec<bool>,
+    dct_blocks: Vec<[[f32; 64]; 3]>,
+    needs_inverse_dct: Vec<[bool; 3]>,
+}
+
 /// Decode all LOSSY_DCT channels: first every CSC group, then the
 /// standalone channels, both in channel order - the order in which the
 /// encoder appended them to the shared AC/DC streams.
+/// The samples of each channel are left in the scratch.
 pub(super) fn decode_lossy_channels(
     infos: &[ChannelInfo],
     csc_groups: &[[usize; 3]],
     ac_packed: &[u16],
     dc_packed: &[u16],
-) -> Result<Vec<Vec<f16>>> {
+    scratch: &mut DecodeScratch,
+) -> Result<()> {
     // Decode CSC triplets first, then standalone lossy channels. The shared
     // AC/DC cursors advance in the same order the encoder wrote them.
     let mut ac = PackedStream::new(ac_packed);
     let mut dc = PackedStream::new(dc_packed);
 
-    let mut samples: Vec<Vec<f16>> = vec![vec![]; infos.len()];
-    let mut grouped = vec![false; infos.len()];
+    let DecodeScratch {
+        samples,
+        grouped,
+        dct_blocks,
+        needs_inverse_dct,
+    } = scratch;
+
+    if samples.len() < infos.len() {
+        samples.resize_with(infos.len(), Vec::new);
+    }
+    grouped.clear();
+    grouped.resize(infos.len(), false);
+
+    // The samples of a channel are taken out of the scratch while they are
+    // decoded. Every sample is written, so they need no clearing.
+    let take_samples = |samples: &mut Vec<Vec<f16>>, channel: usize| {
+        let mut channel_samples = std::mem::take(&mut samples[channel]);
+        reused_slice(&mut channel_samples, infos[channel].width * infos[channel].height);
+        channel_samples
+    };
 
     for &group in csc_groups {
         // all three channels have identical sampling, hence identical size
         let info = &infos[group[0]];
         let mut decoded: [Vec<f16>; 3] =
-            std::array::from_fn(|_| vec![f16::ZERO; info.width * info.height]);
+            std::array::from_fn(|component| take_samples(samples, group[component]));
 
         decode_lossy_dct_group(
             &mut ac,
@@ -337,6 +370,8 @@ pub(super) fn decode_lossy_channels(
             info.height,
             Some(to_linear_table()),
             &mut decoded,
+            dct_blocks,
+            needs_inverse_dct,
         )?;
 
         for (&channel, channel_samples) in group.iter().zip(decoded) {
@@ -349,15 +384,24 @@ pub(super) fn decode_lossy_channels(
         if grouped[index] || info.scheme != CompressorScheme::LossyDct {
             continue;
         }
-        let mut decoded = [vec![f16::ZERO; info.width * info.height]];
+        let mut decoded = [take_samples(samples, index)];
         let to_linear = (!info.quantize_linearly).then(to_linear_table);
-        decode_lossy_dct_group(&mut ac, &mut dc, info.width, info.height, to_linear, &mut decoded)?;
+        decode_lossy_dct_group(
+            &mut ac,
+            &mut dc,
+            info.width,
+            info.height,
+            to_linear,
+            &mut decoded,
+            dct_blocks,
+            needs_inverse_dct,
+        )?;
 
         let [channel_samples] = decoded;
         samples[index] = channel_samples;
     }
 
-    Ok(samples)
+    Ok(())
 }
 
 /// Decode one standalone channel (decoded.len() == 1) or one CSC'd R/G/B
@@ -370,6 +414,8 @@ fn decode_lossy_dct_group(
     height: usize,
     to_linear: Option<&[u16; 65536]>,
     decoded: &mut [Vec<f16>],
+    dct_blocks: &mut Vec<[[f32; 64]; 3]>,
+    needs_inverse_dct: &mut Vec<[bool; 3]>,
 ) -> Result<()> {
     let components = decoded.len();
     let blocks_x = (width + 7) / 8;
@@ -379,8 +425,11 @@ fn decode_lossy_dct_group(
     // Buffer the whole group rather than one block at a time. That lets the
     // inverse DCT batch over every block that actually needs it, matching the
     // structure of the C reference.
-    let mut dct_blocks: Vec<[[f32; 64]; 3]> = vec![[[0.0f32; 64]; 3]; block_count];
-    let mut needs_inverse_dct: Vec<[bool; 3]> = vec![[false; 3]; block_count];
+    // Every block of every component is written before it is read, so the
+    // blocks of an earlier group need no clearing.
+    let dct_blocks = reused_slice_of(dct_blocks, block_count, [[0.0f32; 64]; 3]);
+    let needs_inverse_dct = reused_slice_of(needs_inverse_dct, block_count, [false; 3]);
+    needs_inverse_dct.fill([false; 3]);
 
     for block_y in 0..blocks_y {
         for block_x in 0..blocks_x {

@@ -49,6 +49,7 @@ pub struct DecodeScratch {
 
     b44_channels: Vec<b44::ChannelData>,
     piz: piz::DecodeScratch,
+    dwa: dwa::DecodeScratch,
 }
 
 impl std::fmt::Debug for DecodeScratch {
@@ -395,9 +396,8 @@ impl Compression {
     /// The bytes have the layout that `decompress_image_section_from_le`
     /// returns. It is an error if `decompressed_ne` is too short.
     ///
-    /// All temporary memory is meant to be taken from `scratch`, so that no
-    /// memory is allocated once the scratch has grown to fit the largest
-    /// section. Not all decoders use it yet: some still allocate.
+    /// All temporary memory is taken from `scratch`, so no memory is
+    /// allocated once the scratch has grown to fit the largest section.
     pub fn decompress_image_section_from_le_into(
         self,
         header: &Header,
@@ -469,15 +469,14 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
-            DWAA(_) | DWAB(_) => owned_decompression(decompressed_ne, |expected_byte_size| {
-                dwa::decompress(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
+            DWAA(_) | DWAB(_) => dwa::decompress_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                decompressed_ne,
+            ),
             _ => {
                 return Err(Error::unsupported(format!(
                     "yet unimplemented compression method: {self}"
@@ -680,21 +679,6 @@ fn convert_slice_little_endian_to_current(
     #[cfg(target_endian = "big")]
     reverse_block_endianness(bytes, channels, rectangle)?;
 
-    Ok(())
-}
-
-/// Runs a decompression method that returns its own vector,
-/// for the methods that do not yet decompress into a slice.
-fn owned_decompression(
-    decompressed_ne: &mut [u8],
-    decompress: impl FnOnce(usize) -> Result<ByteVec>,
-) -> UnitResult {
-    let bytes_ne = decompress(decompressed_ne.len())?;
-    if bytes_ne.len() != decompressed_ne.len() {
-        return Err(Error::invalid("decompressed data"));
-    }
-
-    decompressed_ne.copy_from_slice(&bytes_ne);
     Ok(())
 }
 

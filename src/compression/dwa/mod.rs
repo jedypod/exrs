@@ -12,8 +12,8 @@
 // the pipeline lives in its own submodule.
 
 use crate::{
-    compression::ByteVec,
-    error::{Error, Result},
+    compression::{reused_slice, ByteVec, Bytes},
+    error::{Error, Result, UnitResult},
     meta::attribute::{ChannelList, IntegerBounds, SampleType},
 };
 
@@ -31,7 +31,7 @@ pub mod discrete_cosine_transform;
 mod tests;
 
 use channel_layout::{
-    interleave_byte_planes, pack_rle_channels, pack_unknown_channels, split_planar_channels,
+    interleave_byte_planes, locate_planar_channels, pack_rle_channels, pack_unknown_channels,
     split_scanline_channels, u16s_to_le_bytes, write_scanlines,
 };
 use channel_rules::{
@@ -260,17 +260,36 @@ pub fn compress(
     Ok(out)
 }
 
+/// The buffers of the decoder, kept to decode the next chunk without
+/// allocating them again.
+#[derive(Default)]
+pub(super) struct DecodeScratch {
+    classes: ChannelClasses,
+
+    /// The output of zlib, where that is not yet the content of a section.
+    inflated: Vec<u8>,
+    unknown_planar: Vec<u8>,
+    ac_packed: Vec<u16>,
+    dc_packed: Vec<u16>,
+    rle_planar: Vec<u8>,
+
+    /// The RLE channels with the bytes of each sample together.
+    rle_bytes: Vec<u8>,
+
+    /// Where each UNKNOWN channel starts in `unknown_planar`,
+    /// and each RLE channel in `rle_planar` and in `rle_bytes`.
+    channel_starts: Vec<usize>,
+
+    lossy: lossy_dct::DecodeScratch,
+}
+
 pub fn decompress(
     channels: &ChannelList,
     compressed_le: ByteVec,
     rectangle: IntegerBounds,
     expected_byte_size: usize,
-    _pedantic: bool,
+    pedantic: bool,
 ) -> Result<ByteVec> {
-    if compressed_le.is_empty() {
-        return Ok(vec![0u8; expected_byte_size]);
-    }
-
     // the writer stores chunks raw when compression would not have helped
     if compressed_le.len() == expected_byte_size {
         return crate::compression::convert_little_endian_to_current(
@@ -280,7 +299,42 @@ pub fn decompress(
         );
     }
 
-    let mut input = compressed_le.as_slice();
+    let mut decompressed_ne = vec![0_u8; expected_byte_size];
+    decompress_into(
+        channels,
+        &compressed_le,
+        rectangle,
+        pedantic,
+        &mut crate::compression::DecodeScratch::default(),
+        &mut decompressed_ne,
+    )?;
+
+    Ok(decompressed_ne)
+}
+
+/// Decompress a chunk that is not stored raw into exactly the bytes of
+/// the pixels of the rectangle.
+pub(super) fn decompress_into(
+    channels: &ChannelList,
+    compressed_le: Bytes<'_>,
+    rectangle: IntegerBounds,
+    _pedantic: bool,
+    scratch: &mut crate::compression::DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    if compressed_le.is_empty() {
+        decompressed_ne.fill(0);
+        return Ok(());
+    }
+
+    let crate::compression::DecodeScratch {
+        inflater,
+        piz,
+        dwa: scratch,
+        ..
+    } = scratch;
+
+    let mut input = compressed_le;
     let header = DwaHeader::parse(&mut input)?;
 
     let rules = if header.version < 2 {
@@ -289,9 +343,9 @@ pub fn decompress(
         parse_channel_rules(&mut input)?
     };
 
-    let mut classes = ChannelClasses::default();
-    classify_channels(channels, rectangle, &rules, &mut classes);
-    let (channel_infos, csc_groups) = (classes.infos, classes.csc_groups);
+    classify_channels(channels, rectangle, &rules, &mut scratch.classes);
+    let channel_infos = scratch.classes.infos.as_slice();
+    let csc_groups = scratch.classes.csc_groups.as_slice();
 
     if channel_infos.iter().any(|info| {
         info.scheme == CompressorScheme::LossyDct && info.sample_type == SampleType::U32
@@ -301,31 +355,66 @@ pub fn decompress(
 
     let [unknown_section, ac_section, dc_section, rle_section] = split_sections(input, &header)?;
 
-    let unknown_planar = decode_unknown_section(unknown_section, &header)?;
-    let ac_packed = decode_ac_section(ac_section, &header)?;
-    let dc_packed = decode_dc_section(dc_section, &header)?;
-    let rle_planar = decode_rle_section(rle_section, &header)?;
-
-    let unknown_bytes =
-        split_planar_channels(&channel_infos, CompressorScheme::Unknown, &unknown_planar)?;
-    let rle_bytes: Vec<Vec<u8>> =
-        split_planar_channels(&channel_infos, CompressorScheme::Rle, &rle_planar)?
-            .into_iter()
-            .zip(&channel_infos)
-            .map(|(planar, info)| interleave_byte_planes(&planar, info.bytes_per_sample))
-            .collect();
-
-    let lossy_samples = decode_lossy_channels(&channel_infos, &csc_groups, &ac_packed, &dc_packed)?;
-
-    let out = write_scanlines(
-        channels,
-        &channel_infos,
-        rectangle,
-        &lossy_samples,
-        &unknown_bytes,
-        &rle_bytes,
-        expected_byte_size,
+    let unknown_planar =
+        decode_unknown_section(unknown_section, &header, inflater, &mut scratch.unknown_planar)?;
+    let ac_packed = decode_ac_section(
+        ac_section,
+        &header,
+        inflater,
+        piz.huffman_mut(),
+        &mut scratch.inflated,
+        &mut scratch.ac_packed,
+    )?;
+    let dc_packed = decode_dc_section(
+        dc_section,
+        &header,
+        inflater,
+        &mut scratch.inflated,
+        &mut scratch.dc_packed,
+    )?;
+    let rle_planar = decode_rle_section(
+        rle_section,
+        &header,
+        inflater,
+        &mut scratch.inflated,
+        &mut scratch.rle_planar,
     )?;
 
-    crate::compression::convert_little_endian_to_current(out, channels, rectangle)
+    let channel_starts = &mut scratch.channel_starts;
+    channel_starts.clear();
+    channel_starts.resize(channel_infos.len(), 0);
+    locate_planar_channels(
+        channel_infos,
+        CompressorScheme::Unknown,
+        unknown_planar,
+        channel_starts,
+    )?;
+    locate_planar_channels(channel_infos, CompressorScheme::Rle, rle_planar, channel_starts)?;
+
+    let rle_bytes = reused_slice(&mut scratch.rle_bytes, rle_planar.len());
+    for (info, &start) in channel_infos.iter().zip(channel_starts.iter()) {
+        if info.scheme == CompressorScheme::Rle {
+            let range = start..start + info.width * info.height * info.bytes_per_sample;
+            interleave_byte_planes(
+                &rle_planar[range.clone()],
+                info.bytes_per_sample,
+                &mut rle_bytes[range],
+            );
+        }
+    }
+
+    decode_lossy_channels(channel_infos, csc_groups, ac_packed, dc_packed, &mut scratch.lossy)?;
+
+    write_scanlines(
+        channels,
+        channel_infos,
+        rectangle,
+        &scratch.lossy.samples,
+        unknown_planar,
+        rle_bytes,
+        channel_starts,
+        decompressed_ne,
+    )?;
+
+    crate::compression::convert_slice_little_endian_to_current(decompressed_ne, channels, rectangle)
 }

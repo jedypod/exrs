@@ -2,12 +2,13 @@
 // scanline buffer the rest of the crate uses, the per-channel byte runs, the
 // planar byte planes of the UNKNOWN/RLE sections, and back again.
 
+use std::io::Write;
+
 use half::{f16, slice::HalfFloatSliceExt};
 use lebe::io::WriteEndian;
 
 use super::{ChannelInfo, CompressorScheme};
 use crate::{
-    compression::ByteVec,
     error::{Error, Result},
     meta::attribute::{ChannelList, IntegerBounds, SampleType},
 };
@@ -114,59 +115,65 @@ pub(super) fn u16s_to_le_bytes(values: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Split a planar buffer into one byte run per channel of the given scheme,
-/// in channel order (mirrors "DwaCompressor_setupChannelData"s running
-/// per-scheme cursor). Other schemes get an empty vec.
-pub(super) fn split_planar_channels(
+/// Find where the bytes of each channel of the given scheme start in the
+/// planar buffer of that scheme, in channel order (mirrors
+/// "DwaCompressor_setupChannelData"s running per-scheme cursor).
+/// The starts of the channels of other schemes are left as they are.
+pub(super) fn locate_planar_channels(
     infos: &[ChannelInfo],
     scheme: CompressorScheme,
     planar: &[u8],
-) -> Result<Vec<Vec<u8>>> {
-    let mut per_channel = vec![vec![]; infos.len()];
+    channel_starts: &mut [usize],
+) -> Result<()> {
     let mut cursor = 0;
 
-    for (channel_bytes, info) in per_channel.iter_mut().zip(infos) {
+    for (channel_start, info) in channel_starts.iter_mut().zip(infos) {
         if info.scheme != scheme {
             continue;
         }
-        let length = info.width * info.height * info.bytes_per_sample;
-        *channel_bytes = planar
-            .get(cursor..cursor + length)
-            .ok_or_else(|| Error::invalid("truncated DWA channel data"))?
-            .to_vec();
-        cursor += length;
+
+        *channel_start = cursor;
+        cursor += info.width * info.height * info.bytes_per_sample;
+        if cursor > planar.len() {
+            return Err(Error::invalid("truncated DWA channel data"));
+        }
     }
-    Ok(per_channel)
+    Ok(())
 }
 
 /// Restore per-sample byte order from byte planes
-pub(super) fn interleave_byte_planes(planar: &[u8], bytes_per_sample: usize) -> Vec<u8> {
+pub(super) fn interleave_byte_planes(
+    planar: &[u8],
+    bytes_per_sample: usize,
+    interleaved: &mut [u8],
+) {
+    debug_assert_eq!(planar.len(), interleaved.len());
     let sample_count = planar.len() / bytes_per_sample;
-    let mut interleaved = vec![0u8; planar.len()];
     for sample in 0..sample_count {
         for byte in 0..bytes_per_sample {
             interleaved[sample * bytes_per_sample + byte] = planar[byte * sample_count + sample];
         }
     }
-    interleaved
 }
 
 /// Interleave the per-channel decoded data into the scanline layout the
 /// rest of exrs expects: rows of "y" ascending, channels in list order
 /// within each row, samples little-endian.
+///
+/// The UNKNOWN and RLE channels start at their `channel_starts`
+/// in the buffer of their scheme.
 pub(super) fn write_scanlines(
     channels: &ChannelList,
     infos: &[ChannelInfo],
     rectangle: IntegerBounds,
     lossy_samples: &[Vec<f16>],
-    unknown_bytes: &[Vec<u8>],
-    rle_bytes: &[Vec<u8>],
-    expected_byte_size: usize,
-) -> Result<ByteVec> {
+    unknown_bytes: &[u8],
+    rle_bytes: &[u8],
+    channel_starts: &[usize],
+    mut out: &mut [u8],
+) -> Result<()> {
     // Reassemble the per-channel decoded data into the scanline layout the
     // rest of the crate expects: rows in ascending y, channels in list order.
-    let mut out = Vec::with_capacity(expected_byte_size);
-
     for y in rectangle.position.y()..rectangle.end().y() {
         for (index, channel) in channels.list.iter().enumerate() {
             let sampling_y = channel.sampling.y().max(1) as i32;
@@ -205,21 +212,22 @@ pub(super) fn write_scanlines(
 
                 CompressorScheme::Unknown | CompressorScheme::Rle => {
                     let bytes = if info.scheme == CompressorScheme::Unknown {
-                        &unknown_bytes[index]
+                        unknown_bytes
                     } else {
-                        &rle_bytes[index]
+                        rle_bytes
                     };
                     let row_length = info.width * info.bytes_per_sample;
-                    out.extend_from_slice(&bytes[row * row_length..][..row_length]);
+                    let row_start = channel_starts[index] + row * row_length;
+                    out.write_all(&bytes[row_start..][..row_length])?;
                 }
             }
         }
     }
 
-    if out.len() != expected_byte_size {
+    if !out.is_empty() {
         return Err(Error::invalid("DWA decoded size mismatch"));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,14 +268,37 @@ mod test {
             for sample_count in [0usize, 1, 5, 37] {
                 let original = random_bytes(&mut random, sample_count * bytes_per_sample);
                 let planar = separate_byte_planes(&original, bytes_per_sample);
-                let interleaved = interleave_byte_planes(&planar, bytes_per_sample);
+                let mut interleaved = vec![0_u8; planar.len()];
+                interleave_byte_planes(&planar, bytes_per_sample, &mut interleaved);
                 assert_eq!(interleaved, original);
             }
         }
     }
 
-    /// Packing UNKNOWN channels into one planar buffer and splitting it back
-    /// out must reproduce every channel's bytes exactly.
+    /// The bytes of each channel, from where the channel is located.
+    fn split_planar_channels(
+        infos: &[ChannelInfo],
+        scheme: CompressorScheme,
+        planar: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let mut channel_starts = vec![0; infos.len()];
+        locate_planar_channels(infos, scheme, planar, &mut channel_starts).unwrap();
+
+        // a planar buffer that lacks the last byte is refused
+        let truncated = &planar[..planar.len() - 1];
+        assert!(locate_planar_channels(infos, scheme, truncated, &mut channel_starts).is_err());
+
+        infos
+            .iter()
+            .zip(channel_starts)
+            .map(|(info, start)| {
+                planar[start..start + info.width * info.height * info.bytes_per_sample].to_vec()
+            })
+            .collect()
+    }
+
+    /// Packing UNKNOWN channels into one planar buffer and locating them in
+    /// it must reproduce every channel's bytes exactly.
     #[test]
     fn pack_split_unknown_roundtrip() {
         let mut random = rand::rngs::StdRng::from_seed(SEED);
@@ -282,13 +313,14 @@ mod test {
             .collect();
 
         let packed = pack_unknown_channels(&infos, &channel_bytes, CompressorScheme::Unknown);
-        let split = split_planar_channels(&infos, CompressorScheme::Unknown, &packed).unwrap();
+        let split = split_planar_channels(&infos, CompressorScheme::Unknown, &packed);
 
         assert_eq!(split, channel_bytes);
     }
 
-    /// RLE channels are packed via byte-plane separation; splitting the planar
-    /// buffer and interleaving each plane back must recover the input bytes.
+    /// RLE channels are packed via byte-plane separation; locating them in
+    /// the planar buffer and interleaving each plane back must recover the
+    /// input bytes.
     #[test]
     fn pack_split_rle_roundtrip() {
         let mut random = rand::rngs::StdRng::from_seed(SEED);
@@ -303,14 +335,17 @@ mod test {
             .collect();
 
         let packed = pack_rle_channels(&infos, &channel_bytes);
-        // Mirror `mod.rs::decompress`: split the planar buffer per channel,
-        // then interleave each channel's byte planes back to sample order.
-        let planar_per_channel =
-            split_planar_channels(&infos, CompressorScheme::Rle, &packed).unwrap();
+        // Mirror `mod.rs::decompress_into`: locate each channel in the planar
+        // buffer, then interleave its byte planes back to sample order.
+        let planar_per_channel = split_planar_channels(&infos, CompressorScheme::Rle, &packed);
         let decoded: Vec<Vec<u8>> = infos
             .iter()
             .zip(&planar_per_channel)
-            .map(|(info, planar)| interleave_byte_planes(planar, info.bytes_per_sample))
+            .map(|(info, planar)| {
+                let mut interleaved = vec![0_u8; planar.len()];
+                interleave_byte_planes(planar, info.bytes_per_sample, &mut interleaved);
+                interleaved
+            })
             .collect();
 
         assert_eq!(decoded, channel_bytes);

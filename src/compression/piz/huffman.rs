@@ -82,13 +82,8 @@ pub fn max_decompressed_len(compressed: &[u8]) -> usize {
 }
 
 /// Decompress into a new vector, with new tables.
+#[cfg(test)]
 pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
-    // The expected size comes from the file, so refuse a size that the
-    // input cannot decode to before allocating it.
-    if expected_size > max_decompressed_len(compressed) {
-        return Err(Error::invalid(NOT_ENOUGH_DATA));
-    }
-
     let mut output = vec![0_u16; expected_size];
     decompress_into(compressed, &mut DecodeScratch::default(), &mut output)?;
     Ok(output)

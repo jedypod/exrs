@@ -39,6 +39,13 @@ pub struct DecodeScratch {
     huffman: huffman::DecodeScratch,
 }
 
+impl DecodeScratch {
+    /// The tables of the Huffman decoder, which DWA also uses.
+    pub(super) fn huffman_mut(&mut self) -> &mut huffman::DecodeScratch {
+        &mut self.huffman
+    }
+}
+
 pub fn decompress_into(
     channels: &ChannelList,
     compressed_le: Bytes<'_>,

@@ -16,7 +16,22 @@ use crate::{
     math::RoundingMode,
 };
 
-pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
+/// The tables of the decoder, kept to decode the next input without
+/// allocating them again.
+#[derive(Default)]
+pub struct DecodeScratch {
+    /// Indexed by symbol. Only the entries of `symbols` are meaningful.
+    encoding_table: Vec<u64>,
+    symbols: Vec<u32>,
+    decoding_table: DecodingTable,
+}
+
+/// Decompress as many values as the output can hold.
+pub fn decompress_into(
+    compressed: &[u8],
+    scratch: &mut DecodeScratch,
+    output: &mut [u16],
+) -> UnitResult {
     let mut remaining_compressed = compressed;
 
     let min_code_index = usize::try_from(u32::read_le(&mut remaining_compressed)?)?;
@@ -34,23 +49,49 @@ pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
         return Err(Error::invalid(NOT_ENOUGH_DATA));
     }
 
-    let (encoding_table, symbols) =
-        read_encoding_table(&mut remaining_compressed, min_code_index, max_code_index)?;
+    read_encoding_table(
+        &mut remaining_compressed,
+        min_code_index,
+        max_code_index,
+        &mut scratch.encoding_table,
+        &mut scratch.symbols,
+    )?;
     if bit_count > 8 * remaining_compressed.len() {
         return Err(Error::invalid(INVALID_BIT_COUNT));
     }
 
-    let decoding_table = build_decoding_table(&encoding_table, &symbols, max_code_index_32)?;
+    build_decoding_table(
+        &scratch.encoding_table,
+        &scratch.symbols,
+        max_code_index_32,
+        &mut scratch.decoding_table,
+    )?;
 
-    let result = decode_with_tables(
-        &decoding_table,
+    decode_with_tables(
+        &scratch.decoding_table,
         remaining_compressed,
         bit_count,
         max_code_index_32,
-        expected_size,
-    )?;
+        output,
+    )
+}
 
-    Ok(result)
+/// No input of this size decompresses to more values than this.
+pub fn max_decompressed_len(compressed: &[u8]) -> usize {
+    compressed.len().saturating_mul(8 * MAX_VALUES_PER_BIT)
+}
+
+/// Decompress into a new vector, with new tables.
+pub fn decompress(compressed: &[u8], expected_size: usize) -> Result<Vec<u16>> {
+    // The expected size comes from the file, so refuse a size that the
+    // input cannot decode to before allocating it.
+    if expected_size > max_decompressed_len(compressed) {
+        return Err(Error::invalid(NOT_ENOUGH_DATA));
+    }
+
+    let mut output = vec![0_u16; expected_size];
+    decompress_into(compressed, &mut DecodeScratch::default(), &mut output)?;
+    Ok(output)
 }
 
 pub fn compress(uncompressed: &[u16]) -> Result<Vec<u8>> {
@@ -94,6 +135,10 @@ const DECODE_BITS: u64 = 12; // decoding bit size (>= 8); 16 KiB of u32 entries 
 const ENCODING_TABLE_SIZE: usize = ((1 << ENCODE_BITS) + 1) as usize;
 const DECODING_TABLE_SIZE: usize = (1 << DECODE_BITS) as usize;
 
+/// The most values that one bit of input can decode to: a run-length code
+/// repeats at most 255 values and takes at least 9 bits with its count.
+const MAX_VALUES_PER_BIT: usize = 29;
+
 const SHORT_ZEROCODE_RUN: u64 = 59;
 const LONG_ZEROCODE_RUN: u64 = 63;
 const SHORTEST_LONG_RUN: u64 = 2 + LONG_ZEROCODE_RUN - SHORT_ZEROCODE_RUN;
@@ -108,6 +153,23 @@ struct DecodingTable {
     /// zero, as are entries where no code has this prefix.
     entries: Box<[u32; DECODING_TABLE_SIZE]>,
     long: LongCodes,
+}
+
+impl Default for DecodingTable {
+    fn default() -> Self {
+        Self {
+            entries: Box::new([0_u32; DECODING_TABLE_SIZE]),
+            long: LongCodes {
+                lengths: Vec::new(),
+                first_left_aligned: [0; 59],
+                first: [0; 59],
+                offset: [0; 59],
+                count: [0; 59],
+                symbols: Vec::new(),
+                max_length: 0,
+            },
+        }
+    }
 }
 
 /// Codes longer than `DECODE_BITS` bits, decoded arithmetically as in
@@ -244,17 +306,16 @@ fn decode_with_tables(
     input: &[u8],
     input_bit_count: usize,
     run_length_code: u32,
-    expected_output_size: usize,
-) -> Result<Vec<u16>> {
-    // The expected size comes from the file. Every code takes at least one
-    // bit and a run-length code (at least 9 bits with its count) repeats at
-    // most 255 values, so a larger size cannot be valid; refusing it before
-    // allocating keeps a small file from requesting a huge buffer.
-    if expected_output_size > input_bit_count.saturating_mul(29) {
+    output: &mut [u16],
+) -> UnitResult {
+    // Every code takes at least one bit and a run-length code (at least 9
+    // bits with its count) repeats at most 255 values, so a larger output
+    // cannot be filled.
+    let expected_output_size = output.len();
+    if expected_output_size > input_bit_count.saturating_mul(MAX_VALUES_PER_BIT) {
         return Err(Error::invalid(NOT_ENOUGH_DATA));
     }
 
-    let mut output = vec![0_u16; expected_output_size];
     let mut length = 0;
     let mut reader = BitReader::new(input);
     let entries = &*decoding_table.entries;
@@ -326,7 +387,7 @@ fn decode_with_tables(
         return Err(Error::invalid(NOT_ENOUGH_DATA));
     }
 
-    Ok(output)
+    Ok(())
 }
 
 /// Build a decoding table based on the encoding table code:
@@ -336,17 +397,18 @@ fn build_decoding_table(
     encoding_table: &[u64],
     symbols: &[u32],
     run_length_code: u32,
-) -> Result<DecodingTable> {
-    let mut entries = Box::new([0_u32; DECODING_TABLE_SIZE]);
-    let mut long = LongCodes {
-        lengths: Vec::new(),
-        first_left_aligned: [0; 59],
-        first: [0; 59],
-        offset: [0; 59],
-        count: [0; 59],
-        symbols: Vec::new(),
-        max_length: 0,
-    };
+    decoding_table: &mut DecodingTable,
+) -> UnitResult {
+    // the table is reused, so forget the codes of the previous input
+    let DecodingTable {
+        entries,
+        long,
+    } = decoding_table;
+    entries.fill(0);
+    long.first_left_aligned = [0; 59];
+    long.first = [0; 59];
+    long.count = [0; 59];
+    long.max_length = 0;
 
     for &symbol in symbols {
         let encoded_code = encoding_table[symbol as usize];
@@ -385,9 +447,10 @@ fn build_decoding_table(
         }
     }
 
-    long.lengths = (DECODE_BITS + 1..=long.max_length)
-        .filter(|&length| long.count[length as usize] != 0)
-        .collect();
+    long.lengths.clear();
+    let count = &long.count;
+    long.lengths
+        .extend((DECODE_BITS + 1..=long.max_length).filter(|&length| count[length as usize] != 0));
 
     // Group the long-code symbols by length, keeping code order within each.
     let mut total = 0;
@@ -396,7 +459,8 @@ fn build_decoding_table(
         total += count;
     }
     let mut next = long.offset;
-    long.symbols = vec![0; total as usize];
+    long.symbols.clear();
+    long.symbols.resize(total as usize, 0);
     for &symbol in symbols {
         let length = length(encoding_table[symbol as usize]);
         if length > DECODE_BITS {
@@ -406,10 +470,7 @@ fn build_decoding_table(
         }
     }
 
-    Ok(DecodingTable {
-        entries,
-        long,
-    })
+    Ok(())
 }
 
 /// Run-length-decompresses all zero runs from the packed table to the encoding
@@ -418,15 +479,22 @@ fn read_encoding_table(
     packed: &mut impl Read,
     min_code_index: usize,
     max_code_index: usize,
-) -> Result<(Vec<u64>, Vec<u32>)> {
+    encoding_table: &mut Vec<u64>,
+    symbols: &mut Vec<u32>,
+) -> UnitResult {
     let mut code_bits = 0_u64;
     let mut code_bit_count = 0_u64;
     // The symbols that have a code, ascending: usually far fewer than the
     // table's 65,537 entries, so later passes visit only these.
-    let mut symbols = Vec::new();
+    symbols.clear();
 
+    // The table is reused without clearing it. Every entry from the minimum
+    // to the maximum code index is written below, and the entries outside
+    // of that range are never read, as only those of `symbols` are.
     // TODO push() into encoding table instead of index stuff?
-    let mut encoding_table = vec![0_u64; ENCODING_TABLE_SIZE];
+    if encoding_table.len() != ENCODING_TABLE_SIZE {
+        *encoding_table = vec![0_u64; ENCODING_TABLE_SIZE];
+    }
     let mut code_index = min_code_index;
     while code_index <= max_code_index {
         let code_len = read_bits(6, &mut code_bits, &mut code_bit_count, packed)?;
@@ -464,8 +532,7 @@ fn read_encoding_table(
         }
     }
 
-    build_canonical_table(&mut encoding_table, symbols.iter().map(|&symbol| symbol as usize))?;
-    Ok((encoding_table, symbols))
+    build_canonical_table(encoding_table, symbols.iter().map(|&symbol| symbol as usize))
 }
 
 // TODO Use BitStreamReader for all the bit reads?!
@@ -1103,10 +1170,12 @@ mod test {
         encoding_table[..1 << 16].fill(16);
         let symbols: Vec<u32> = (0..1 << 16).collect();
         build_canonical_table(&mut encoding_table, 0..1 << 16).unwrap();
-        let decoding_table = build_decoding_table(&encoding_table, &symbols, 1 << 16).unwrap();
+        let mut decoding_table = DecodingTable::default();
+        build_decoding_table(&encoding_table, &symbols, 1 << 16, &mut decoding_table).unwrap();
 
         let input = [0xff_u8; 12];
-        let decoded = decode_with_tables(&decoding_table, &input, 6 * 16, 1 << 16, 6).unwrap();
+        let mut decoded = [0_u16; 6];
+        decode_with_tables(&decoding_table, &input, 6 * 16, 1 << 16, &mut decoded).unwrap();
 
         assert_eq!(decoded, [u16::MAX; 6]);
     }

@@ -10,12 +10,13 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
+    convert::TryInto,
     io::Cursor,
 };
 
 use exr::{
     block::{
-        chunk::{BlockLocation, Chunk, ChunkRef},
+        chunk::{BlockLocation, Chunk, ChunkRef, CompressedBlock},
         UncompressedBlock,
     },
     compression::DecodeScratch,
@@ -76,6 +77,13 @@ fn count_allocations(function: impl FnOnce()) -> usize {
     let before = ALLOCATION_COUNT.with(Cell::get);
     function();
     ALLOCATION_COUNT.with(Cell::get) - before
+}
+
+/// The number of bytes that this thread allocated in the function.
+fn count_allocated_bytes(function: impl FnOnce()) -> usize {
+    let before = ALLOCATED_BYTES.with(Cell::get);
+    function();
+    ALLOCATED_BYTES.with(Cell::get) - before
 }
 
 const ALL_COMPRESSIONS: [Compression; 10] = [
@@ -152,6 +160,15 @@ fn read_chunks(bytes: &[u8]) -> (MetaData, Vec<Chunk>) {
 
 fn chunk_ref(chunk: &Chunk) -> ChunkRef<'_> {
     chunk.as_flat_ref().expect("flat chunk")
+}
+
+/// The compressed pixels of a flat chunk.
+fn compressed_pixels_mut(chunk: &mut Chunk) -> &mut Vec<u8> {
+    match &mut chunk.compressed_block {
+        CompressedBlock::ScanLine(block) => &mut block.compressed_pixels_le,
+        CompressedBlock::Tile(block) => &mut block.compressed_pixels_le,
+        _ => panic!("deep chunk"),
+    }
 }
 
 #[test]
@@ -359,6 +376,84 @@ fn a_chunk_size_beyond_the_bytes_is_an_error() {
         // truncated bytes, also inside of the fields before the pixels
         for available in [0, 3, size_position + 3, chunk_bytes.len() - 1] {
             assert!(read_with_size(pixel_size as i32, available).is_err(), "{} bytes", available);
+        }
+    }
+}
+
+/// The header of a DWA chunk states the size of each of its sections. Without
+/// a limit, the decoder would make room for whatever a damaged header claims,
+/// and keep that room in the scratch.
+#[test]
+fn damaged_dwa_section_sizes_are_an_error() {
+    let mut scratch = DecodeScratch::default();
+
+    for compression in [Compression::DWAA(None), Compression::DWAB(None)] {
+        let bytes = write_image(compression, Blocks::ScanLines, Vec2(71, 277));
+        let (meta_data, chunks) = read_chunks(&bytes);
+        let mut destination = vec![0_u8; meta_data.headers[0].max_block_byte_size()];
+
+        // let the scratch grow to fit the block
+        UncompressedBlock::decompress_chunk_into(
+            chunk_ref(&chunks[0]),
+            &meta_data,
+            false,
+            &mut scratch,
+            &mut destination,
+        )
+        .unwrap();
+
+        // the chunk starts with little-endian counters, among them these
+        const UNKNOWN_UNCOMPRESSED_SIZE: usize = 1;
+        const RLE_UNCOMPRESSED_SIZE: usize = 6;
+        const RLE_RAW_SIZE: usize = 7;
+        const AC_COUNT: usize = 8;
+        const DC_COUNT: usize = 9;
+
+        for counter in
+            [UNKNOWN_UNCOMPRESSED_SIZE, RLE_UNCOMPRESSED_SIZE, RLE_RAW_SIZE, AC_COUNT, DC_COUNT]
+        {
+            let counter_bytes = counter * 8..counter * 8 + 8;
+
+            let mut chunk = chunks[0].clone();
+            let pixels = compressed_pixels_mut(&mut chunk);
+            let value = u64::from_le_bytes(pixels[counter_bytes.clone()].try_into().unwrap());
+            assert_ne!(value, 0, "{}: the chunk should have data in every section", compression);
+
+            // values so large that the allocator of this test refuses them,
+            // and values that are merely larger than the chunk can hold
+            for damaged_value in [1 << 62, 1 << 40, 1 << 32, value * 1000, value * 40] {
+                let mut chunk = chunks[0].clone();
+                compressed_pixels_mut(&mut chunk)[counter_bytes.clone()]
+                    .copy_from_slice(&u64::to_le_bytes(damaged_value));
+
+                let allocated_bytes = count_allocated_bytes(|| {
+                    let result = UncompressedBlock::decompress_chunk_into(
+                        chunk_ref(&chunk),
+                        &meta_data,
+                        false,
+                        &mut scratch,
+                        &mut destination,
+                    );
+
+                    // only the error message is allocated
+                    assert!(
+                        result.is_err(),
+                        "{}: counter {} of {} should be refused",
+                        compression,
+                        counter,
+                        damaged_value
+                    );
+                });
+
+                assert!(
+                    allocated_bytes < 1024,
+                    "{}: counter {} of {} made the scratch grow by {} bytes",
+                    compression,
+                    counter,
+                    damaged_value,
+                    allocated_bytes
+                );
+            }
         }
     }
 }

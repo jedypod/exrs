@@ -312,6 +312,54 @@ pub fn decompress(
     Ok(decompressed_ne)
 }
 
+/// Refuse a chunk whose header claims more data in a section than any chunk
+/// of this size can hold. The sizes come from the file and decide how much
+/// memory decoding takes, so a damaged size must not be trusted.
+///
+/// The limits are the sizes of the buffers that OpenEXR allocates for a
+/// chunk ("DwaCompressor_initializeBuffers"), which refuses the same chunks.
+fn validate_section_sizes(
+    header: &DwaHeader,
+    infos: &[ChannelInfo],
+    rectangle: IntegerBounds,
+) -> UnitResult {
+    let pixel_count = rectangle.size.area();
+    let block_count = rectangle.size.width().div_ceil(8) * rectangle.size.height().div_ceil(8);
+
+    let mut lossy_channel_count = 0;
+    let mut max_rle_size = 0;
+    let mut unknown_size = 0;
+
+    for info in infos {
+        match info.scheme {
+            CompressorScheme::LossyDct => lossy_channel_count += 1,
+            // RLE, if gone horribly wrong, could double the size of the data
+            CompressorScheme::Rle => max_rle_size += 2 * pixel_count * info.bytes_per_sample,
+            CompressorScheme::Unknown => unknown_size += pixel_count * info.bytes_per_sample,
+        }
+    }
+
+    // OpenEXR makes room for the largest possible zlib stream of the data,
+    // which this is slightly larger than.
+    let max_unknown_size = if unknown_size == 0 {
+        0
+    } else {
+        unknown_size + unknown_size / 32 + 1024
+    };
+
+    let plausible = header.unknown_uncompressed_size <= max_unknown_size
+        && header.ac_count <= block_count * 63 * lossy_channel_count
+        && header.dc_count <= block_count * lossy_channel_count
+        && header.rle_uncompressed_size <= max_rle_size
+        && header.rle_raw_size <= max_rle_size;
+
+    if plausible {
+        Ok(())
+    } else {
+        Err(Error::invalid("DWA section size exceeds the chunk"))
+    }
+}
+
 /// Decompress a chunk that is not stored raw into exactly the bytes of
 /// the pixels of the rectangle.
 pub(super) fn decompress_into(
@@ -352,6 +400,8 @@ pub(super) fn decompress_into(
     }) {
         return Err(Error::unsupported("DWA lossy DCT compression of u32 channels"));
     }
+
+    validate_section_sizes(&header, channel_infos, rectangle)?;
 
     let [unknown_section, ac_section, dc_section, rle_section] = split_sections(input, &header)?;
 

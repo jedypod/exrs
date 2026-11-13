@@ -29,7 +29,7 @@
 use lebe::io::ReadPrimitive;
 
 use super::*;
-use crate::error::Result;
+use crate::error::{Result, UnitResult};
 
 // scanline decompreroussion tine, see https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfScanLineInputFile.cpp
 // 1. Uncompress the data, if necessary (If the line is uncompressed, it's in
@@ -157,23 +157,23 @@ pub fn compress(channels: &ChannelList, bytes_ne: ByteVec, area: IntegerBounds) 
     super::zlib_compress(&encoded_be, 4)
 }
 
-pub fn decompress(
+pub fn decompress_into(
     channels: &ChannelList,
-    bytes_le: ByteVec,
+    bytes_le: Bytes<'_>,
     area: IntegerBounds,
-    expected_byte_size: usize,
     pedantic: bool,
-) -> Result<ByteVec> {
-    let options = zune_inflate::DeflateOptions::default()
-        .set_limit(expected_byte_size)
-        .set_size_hint(expected_byte_size);
-    let mut decompressor = zune_inflate::DeflateDecoder::new_with_options(&bytes_le, options);
+    scratch: &mut DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    if bytes_le.is_empty() {
+        return Err(Error::invalid("decompressed data"));
+    }
 
-    let encoded_be =
-        decompressor.decode_zlib().map_err(|_| Error::invalid("zlib-compressed data malformed"))?; // TODO share code with zip?
-
-    let mut encoded_be = encoded_be.as_slice();
-    let mut out = Vec::with_capacity(expected_byte_size.min(2048 * 4));
+    // every sample is encoded with at most as many bytes as it decodes to
+    let encoded_be = reused_slice(&mut scratch.packed_bytes, decompressed_ne.len());
+    let encoded_size = scratch.inflater.inflate(bytes_le, encoded_be)?; // TODO share code with zip?
+    let mut encoded_be = &encoded_be[..encoded_size];
+    let mut remaining_out = decompressed_ne;
 
     for y in area.position.1..area.end().1 {
         for channel in &channels.list {
@@ -191,15 +191,24 @@ pub fn decompress(
                 Ok(samples)
             };
 
+            let line_byte_count = sample_count_x * channel.sample_type.bytes_per_sample();
+            if line_byte_count > remaining_out.len() {
+                return Err(Error::invalid("decompressed data"));
+            }
+            let (out, rest) = std::mem::take(&mut remaining_out).split_at_mut(line_byte_count);
+            remaining_out = rest;
+
             match channel.sample_type {
                 SampleType::F16 => {
                     let sample_byte_pairs = read_sample_line()?.iter().zip(read_sample_line()?);
 
                     let mut pixel_accumulation: u32 = 0;
-                    for (&in_byte_0, &in_byte_1) in sample_byte_pairs {
+                    for ((&in_byte_0, &in_byte_1), out) in
+                        sample_byte_pairs.zip(out.chunks_exact_mut(2))
+                    {
                         let difference = u16::from_be_bytes([in_byte_0, in_byte_1]) as u32;
                         pixel_accumulation = pixel_accumulation.overflowing_add(difference).0;
-                        out.extend_from_slice(&(pixel_accumulation as u16).to_ne_bytes());
+                        out.copy_from_slice(&(pixel_accumulation as u16).to_ne_bytes());
                     }
                 }
 
@@ -211,11 +220,13 @@ pub fn decompress(
                         .zip(read_sample_line()?);
 
                     let mut pixel_accumulation: u32 = 0;
-                    for (((&in_byte_0, &in_byte_1), &in_byte_2), &in_byte_3) in sample_byte_quads {
+                    for ((((&in_byte_0, &in_byte_1), &in_byte_2), &in_byte_3), out) in
+                        sample_byte_quads.zip(out.chunks_exact_mut(4))
+                    {
                         let difference =
                             u32::from_be_bytes([in_byte_0, in_byte_1, in_byte_2, in_byte_3]);
                         pixel_accumulation = pixel_accumulation.overflowing_add(difference).0;
-                        out.extend_from_slice(&pixel_accumulation.to_ne_bytes());
+                        out.copy_from_slice(&pixel_accumulation.to_ne_bytes());
                     }
                 }
 
@@ -226,10 +237,12 @@ pub fn decompress(
                         .zip(read_sample_line()?);
 
                     let mut pixel_accumulation: u32 = 0;
-                    for ((&in_byte_0, &in_byte_1), &in_byte_2) in sample_byte_triplets {
+                    for (((&in_byte_0, &in_byte_1), &in_byte_2), out) in
+                        sample_byte_triplets.zip(out.chunks_exact_mut(4))
+                    {
                         let difference = u32::from_be_bytes([in_byte_0, in_byte_1, in_byte_2, 0]);
                         pixel_accumulation = pixel_accumulation.overflowing_add(difference).0;
-                        out.extend_from_slice(&pixel_accumulation.to_ne_bytes());
+                        out.copy_from_slice(&pixel_accumulation.to_ne_bytes());
                     }
                 }
             }
@@ -240,7 +253,11 @@ pub fn decompress(
         return Err(Error::invalid("too much data"));
     }
 
-    Ok(out)
+    if !remaining_out.is_empty() {
+        return Err(Error::invalid("decompressed data"));
+    }
+
+    Ok(())
 }
 
 /// Conversion from 32-bit to 24-bit floating-point numbers.

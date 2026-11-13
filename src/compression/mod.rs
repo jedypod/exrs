@@ -451,15 +451,14 @@ impl Compression {
                     pedantic,
                 )
             }),
-            PXR24 => owned_decompression(decompressed_ne, |expected_byte_size| {
-                pxr24::decompress(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
+            PXR24 => pxr24::decompress_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                decompressed_ne,
+            ),
             B44 | B44A => owned_decompression(decompressed_ne, |expected_byte_size| {
                 b44::decompress(
                     channels,

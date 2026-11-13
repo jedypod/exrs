@@ -1,7 +1,7 @@
 // see https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfCompressor.cpp
 
 use super::{optimize_bytes::*, *};
-use crate::error::Result;
+use crate::error::{Result, UnitResult};
 
 // scanline decompression routine, see https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfScanLineInputFile.cpp
 // 1. Uncompress the data, if necessary (If the line is uncompressed, it's in
@@ -10,25 +10,23 @@ use crate::error::Result;
 //    machine-independent representation
 // 4. Fill the frame buffer with pixel data, respective to sampling and whatnot
 
-pub fn decompress_bytes(
+pub fn decompress_bytes_into(
     channels: &ChannelList,
-    data_le: ByteVec,
+    data_le: Bytes<'_>,
     rectangle: IntegerBounds,
-    expected_byte_size: usize,
     _pedantic: bool,
-) -> Result<ByteVec> {
-    let options = zune_inflate::DeflateOptions::default()
-        .set_limit(expected_byte_size)
-        .set_size_hint(expected_byte_size);
-    let mut decoder = zune_inflate::DeflateDecoder::new_with_options(&data_le, options);
-    let mut decompressed_le =
-        decoder.decode_zlib().map_err(|_| Error::invalid("zlib-compressed data malformed"))?;
+    scratch: &mut DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    let packed_le = reused_slice(&mut scratch.packed_bytes, decompressed_ne.len());
+    if scratch.inflater.inflate(data_le, packed_le)? != packed_le.len() {
+        return Err(Error::invalid("decompressed data"));
+    }
 
-    differences_to_samples(&mut decompressed_le);
-    interleave_byte_blocks(&mut decompressed_le);
+    differences_to_samples(packed_le);
+    interleave_byte_blocks(packed_le, decompressed_ne);
 
-    super::convert_little_endian_to_current(decompressed_le, channels, rectangle)
-    // TODO no alloc
+    super::convert_slice_little_endian_to_current(decompressed_ne, channels, rectangle)
 }
 
 pub fn compress_bytes(

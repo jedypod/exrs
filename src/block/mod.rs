@@ -183,7 +183,7 @@ impl UncompressedBlock {
     ///
     /// All temporary memory is meant to be taken from `scratch`, so that no
     /// memory is allocated once it has grown to fit the largest block.
-    /// The decoders do not use it yet, and still allocate.
+    /// Not all decoders use it yet: some still allocate.
     pub fn decompress_chunk_into(
         chunk: ChunkRef<'_>,
         meta_data: &MetaData,

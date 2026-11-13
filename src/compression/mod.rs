@@ -40,15 +40,67 @@ pub type Bytes<'s> = &'s [u8];
 /// keep it for as long as blocks are being decoded: one per thread that
 /// decodes. Any scratch can decode any block of any file.
 #[derive(Default)]
-#[allow(missing_copy_implementations)] // will own buffers
 pub struct DecodeScratch {
-    // the decoders move their buffers here one by one
-    _buffers: (),
+    inflater: Inflater,
+
+    /// The bytes of a block before they are rearranged into the output
+    /// layout, for the methods that have such a stage.
+    packed_bytes: ByteVec,
 }
 
 impl std::fmt::Debug for DecodeScratch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("DecodeScratch").finish_non_exhaustive()
+    }
+}
+
+/// The first `length` elements of a reused buffer, growing it if it is
+/// shorter. The contents are whatever an earlier use left there.
+fn reused_slice<T: Copy + Default>(buffer: &mut Vec<T>, length: usize) -> &mut [T] {
+    reused_slice_of(buffer, length, T::default())
+}
+
+/// The first `length` elements of a reused buffer, replacing it with a
+/// longer one of the zero value if it is shorter.
+fn reused_slice_of<T: Copy>(buffer: &mut Vec<T>, length: usize, zero: T) -> &mut [T] {
+    if buffer.len() < length {
+        // The contents need not be kept, so the longer buffer is requested
+        // zeroed from the allocator. That is cheaper than growing the buffer
+        // and filling the new part: memory that is never written to, as when
+        // a damaged file claims a huge size, is then never touched at all.
+        *buffer = Vec::new();
+        *buffer = vec![zero; length];
+    }
+
+    &mut buffer[..length]
+}
+
+/// Inflates zlib streams, keeping the inflate state between streams.
+#[derive(Default)]
+struct Inflater {
+    /// Created on first use, as it allocates.
+    state: Option<zlib_rs::Inflate>,
+}
+
+impl Inflater {
+    /// Inflate a whole zlib stream into `output`, returning the number of
+    /// bytes written. It is an error if the stream is damaged, incomplete,
+    /// or holds more than `output` can take.
+    fn inflate(&mut self, compressed: &[u8], output: &mut [u8]) -> Result<usize> {
+        const WINDOW_BITS: u8 = 15;
+
+        let state = match &mut self.state {
+            Some(state) => {
+                state.reset(true);
+                state
+            }
+            none => none.insert(zlib_rs::Inflate::new(true, WINDOW_BITS)),
+        };
+
+        match state.decompress(compressed, output, zlib_rs::InflateFlush::Finish) {
+            Ok(zlib_rs::Status::StreamEnd) => Ok(state.total_out() as usize),
+            _ => Err(Error::invalid("zlib-compressed data malformed")),
+        }
     }
 }
 
@@ -342,14 +394,14 @@ impl Compression {
     ///
     /// All temporary memory is meant to be taken from `scratch`, so that no
     /// memory is allocated once the scratch has grown to fit the largest
-    /// section. The decoders do not use it yet, and still allocate.
+    /// section. Not all decoders use it yet: some still allocate.
     pub fn decompress_image_section_from_le_into(
         self,
         header: &Header,
         compressed_le: Bytes<'_>,
         pixel_section: IntegerBounds,
         pedantic: bool,
-        _scratch: &mut DecodeScratch,
+        scratch: &mut DecodeScratch,
         decompressed_ne: &mut [u8],
     ) -> Result<usize> {
         let expected_byte_size = self.validate_image_section(header, pixel_section);
@@ -374,24 +426,22 @@ impl Compression {
         let result = match self {
             // uncompressed data always has the expected size
             Uncompressed => Err(Error::invalid("decompressed data")),
-            ZIP16 | ZIP1 => owned_decompression(decompressed_ne, |expected_byte_size| {
-                zip::decompress_bytes(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
-            RLE => owned_decompression(decompressed_ne, |expected_byte_size| {
-                rle::decompress_bytes(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
+            ZIP16 | ZIP1 => zip::decompress_bytes_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                decompressed_ne,
+            ),
+            RLE => rle::decompress_bytes_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                decompressed_ne,
+            ),
             PIZ => owned_decompression(decompressed_ne, |expected_byte_size| {
                 piz::decompress(
                     channels,
@@ -890,47 +940,45 @@ mod optimize_bytes {
         });
     }
 
-    /// Interleave the bytes such that the second half of the array is every
-    /// other byte.
-    pub fn interleave_byte_blocks(separated: &mut [u8]) {
-        with_reused_buffer(separated.len(), |interleaved| {
-            // Split the two halves that we are going to interleave.
-            let (first_half, second_half) = separated.split_at((separated.len() + 1) / 2);
-            // The first half can be 1 byte longer than the second if the length
-            // of the input is odd, but the loop below only
-            // processes numbers in pairs. To handle it, preserve
-            // the last element of the first slice, to be handled
-            // after the loop.
-            let first_half_last = first_half.last();
-            // Truncate the first half to match the lenght of the second one;
-            // more optimizer-friendly
-            let first_half_iter = &first_half[..second_half.len()];
+    /// Interleave the bytes of both halves of `separated` into `interleaved`,
+    /// which must have the same length: every other byte comes from the
+    /// second half.
+    pub fn interleave_byte_blocks(separated: &[u8], interleaved: &mut [u8]) {
+        debug_assert_eq!(separated.len(), interleaved.len());
 
-            // Main loop that performs the interleaving
-            for ((first, second), interleaved) in
-                first_half_iter.iter().zip(second_half.iter()).zip(interleaved.chunks_exact_mut(2))
-            {
-                // The length of each chunk is known to be 2 at compile time,
-                // and each index is also a constant.
-                // This allows the compiler to remove the bounds checks.
-                interleaved[0] = *first;
-                interleaved[1] = *second;
+        // Split the two halves that we are going to interleave.
+        let (first_half, second_half) = separated.split_at((separated.len() + 1) / 2);
+        // The first half can be 1 byte longer than the second if the length
+        // of the input is odd, but the loop below only
+        // processes numbers in pairs. To handle it, preserve
+        // the last element of the first slice, to be handled
+        // after the loop.
+        let first_half_last = first_half.last();
+        // Truncate the first half to match the lenght of the second one;
+        // more optimizer-friendly
+        let first_half_iter = &first_half[..second_half.len()];
+
+        // Main loop that performs the interleaving
+        for ((first, second), interleaved) in
+            first_half_iter.iter().zip(second_half.iter()).zip(interleaved.chunks_exact_mut(2))
+        {
+            // The length of each chunk is known to be 2 at compile time,
+            // and each index is also a constant.
+            // This allows the compiler to remove the bounds checks.
+            interleaved[0] = *first;
+            interleaved[1] = *second;
+        }
+
+        // If the length of the slice was odd, restore the last element of
+        // the first half that we saved
+        if interleaved.len() % 2 == 1 {
+            if let Some(value) = first_half_last {
+                // we can unwrap() here because we just checked that the
+                // lenght is non-zero: `% 2 == 1` will
+                // fail for zero
+                *interleaved.last_mut().unwrap() = *value;
             }
-
-            // If the length of the slice was odd, restore the last element of
-            // the first half that we saved
-            if interleaved.len() % 2 == 1 {
-                if let Some(value) = first_half_last {
-                    // we can unwrap() here because we just checked that the
-                    // lenght is non-zero: `% 2 == 1` will
-                    // fail for zero
-                    *interleaved.last_mut().unwrap() = *value;
-                }
-            }
-
-            // write out the results
-            separated.copy_from_slice(interleaved);
-        });
+        }
     }
 
     /// Separate the bytes such that the second half contains every other byte.
@@ -982,9 +1030,10 @@ mod optimize_bytes {
             let mut modified = source.clone();
 
             super::separate_bytes_fragments(&mut modified);
-            super::interleave_byte_blocks(&mut modified);
+            let mut interleaved = vec![0; modified.len()];
+            super::interleave_byte_blocks(&modified, &mut interleaved);
 
-            assert_eq!(source, modified);
+            assert_eq!(source, interleaved);
         }
 
         #[test]

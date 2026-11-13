@@ -94,7 +94,17 @@ pub(super) fn decode_rle_section(section: &[u8], header: &DwaHeader) -> Result<V
         return Ok(vec![]);
     }
     let inflated = inflate(section, header.rle_uncompressed_size)?;
-    crate::compression::rle::unpack_rle_tokens(&inflated, header.rle_raw_size, false)
+
+    // Every token unpacks to at most 127 bytes and takes at least two bytes;
+    // refuse a size that the tokens cannot unpack to before allocating it.
+    if header.rle_raw_size > inflated.len().saturating_mul(64) {
+        return Err(Error::invalid("DWA RLE data size mismatch"));
+    }
+
+    let mut raw = vec![0_u8; header.rle_raw_size];
+    let length = crate::compression::rle::unpack_rle_tokens(&inflated, &mut raw, false)?;
+    raw.truncate(length);
+    Ok(raw)
 }
 
 /// Ports "internal_zip_reconstruct_bytes": undo differencing, then

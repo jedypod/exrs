@@ -1,47 +1,65 @@
 use super::{optimize_bytes::*, Error, Result, *};
+use crate::error::UnitResult;
 
 // inspired by  https://github.com/openexr/openexr/blob/master/OpenEXR/IlmImf/ImfRle.cpp
 
 const MIN_RUN_LENGTH: usize = 3;
 const MAX_RUN_LENGTH: usize = 127;
 
-pub fn decompress_bytes(
+pub fn decompress_bytes_into(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: Bytes<'_>,
     rectangle: IntegerBounds,
-    expected_byte_size: usize,
     pedantic: bool,
-) -> Result<ByteVec> {
-    let mut decompressed_le = unpack_rle_tokens(&compressed_le, expected_byte_size, pedantic)?;
-    differences_to_samples(&mut decompressed_le);
-    interleave_byte_blocks(&mut decompressed_le);
-    super::convert_little_endian_to_current(decompressed_le, channels, rectangle)
-    // TODO no alloc
+    scratch: &mut DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    let packed_le = reused_slice(&mut scratch.packed_bytes, decompressed_ne.len());
+    if unpack_rle_tokens(compressed_le, packed_le, pedantic)? != packed_le.len() {
+        return Err(Error::invalid("decompressed data"));
+    }
+
+    differences_to_samples(packed_le);
+    interleave_byte_blocks(packed_le, decompressed_ne);
+    super::convert_slice_little_endian_to_current(decompressed_ne, channels, rectangle)
 }
 
+/// Unpacks the tokens into the start of `decompressed_le` until that is full
+/// or the tokens end, and returns the number of bytes unpacked. It is an
+/// error if a token unpacks to more bytes than `decompressed_le` can take.
+///
 /// Shared by this compression method and DWA's RLE scheme (both port OpenEXR's
 /// `internal_rle_decompress`, see `compression::dwa`) - kept separate from
-/// `decompress_bytes` because DWA does not apply the delta prediction /
+/// `decompress_bytes_into` because DWA does not apply the delta prediction /
 /// byte-block interleaving done there.
 pub(super) fn unpack_rle_tokens(
     compressed_le: &[u8],
-    expected_byte_size: usize,
+    decompressed_le: &mut [u8],
     pedantic: bool,
-) -> Result<ByteVec> {
+) -> Result<usize> {
     let mut remaining_le = compressed_le;
-    let mut decompressed_le = Vec::with_capacity(expected_byte_size.min(8 * 2048));
+    let mut length = 0;
 
-    while !remaining_le.is_empty() && decompressed_le.len() != expected_byte_size {
+    while !remaining_le.is_empty() && length != decompressed_le.len() {
         let count = take_1(&mut remaining_le)? as i8 as i32;
 
         if count < 0 {
             // take the next '-count' bytes as-is
             let values = take_n(&mut remaining_le, -count as usize)?;
-            decompressed_le.extend_from_slice(values);
+            decompressed_le
+                .get_mut(length..length + values.len())
+                .ok_or_else(|| Error::invalid("data amount"))?
+                .copy_from_slice(values);
+            length += values.len();
         } else {
             // repeat the next value 'count + 1' times
             let value = take_1(&mut remaining_le)?;
-            decompressed_le.resize(decompressed_le.len() + (count as usize) + 1, value);
+            let run_length = (count as usize) + 1;
+            decompressed_le
+                .get_mut(length..length + run_length)
+                .ok_or_else(|| Error::invalid("data amount"))?
+                .fill(value);
+            length += run_length;
         }
     }
 
@@ -49,7 +67,7 @@ pub(super) fn unpack_rle_tokens(
         return Err(Error::invalid("data amount"));
     }
 
-    Ok(decompressed_le)
+    Ok(length)
 }
 
 pub fn compress_bytes(

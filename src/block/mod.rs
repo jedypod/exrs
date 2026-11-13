@@ -19,14 +19,19 @@ use std::io::{Read, Seek, Write};
 use crate::{
     block::{
         chunk::{
-            Chunk, CompressedBlock, CompressedScanLineBlock, CompressedTileBlock, TileCoordinates,
+            BlockLocation, Chunk, ChunkRef, CompressedBlock, CompressedScanLineBlock,
+            CompressedTileBlock, TileCoordinates,
         },
         lines::{LineIndex, LineRef, LineRefMut, LineSlice},
     },
-    compression::ByteVec,
+    compression::{ByteVec, DecodeScratch},
     error::{usize_to_i32, Error, Result, UnitResult},
     math::Vec2,
-    meta::{attribute::ChannelList, header::Header, BlockDescription, Headers, MetaData},
+    meta::{
+        attribute::{ChannelList, IntegerBounds},
+        header::Header,
+        BlockDescription, Headers, MetaData,
+    },
 };
 
 /// Specifies where a block of pixel data should be placed in the actual image.
@@ -134,15 +139,16 @@ impl UncompressedBlock {
     #[inline]
     #[must_use]
     pub fn decompress_chunk(chunk: Chunk, meta_data: &MetaData, pedantic: bool) -> Result<Self> {
-        let header: &Header = meta_data
-            .headers
-            .get(chunk.layer_index)
-            .ok_or_else(|| Error::invalid("chunk layer index"))?;
+        let location = match &chunk.compressed_block {
+            CompressedBlock::Tile(tile) => BlockLocation::Tile(tile.coordinates),
+            CompressedBlock::ScanLine(block) => BlockLocation::ScanLine {
+                y_coordinate: block.y_coordinate,
+            },
+            _ => return Err(Error::unsupported("deep data not supported yet")),
+        };
 
-        let tile_data_indices = header.get_block_data_indices(&chunk.compressed_block)?;
-        let absolute_indices = header.get_absolute_block_pixel_coordinates(tile_data_indices)?;
-
-        absolute_indices.validate(Some(header.layer_size))?;
+        let (header, index, absolute_indices) =
+            Self::locate_block(chunk.layer_index, location, meta_data)?;
 
         match chunk.compressed_block {
             CompressedBlock::Tile(CompressedTileBlock {
@@ -159,16 +165,77 @@ impl UncompressedBlock {
                     absolute_indices,
                     pedantic,
                 )?,
-                index: BlockIndex {
-                    layer: chunk.layer_index,
-                    pixel_position: absolute_indices.position.to_usize("data indices start")?,
-                    level: tile_data_indices.level_index,
-                    pixel_size: absolute_indices.size,
-                },
+                index,
             }),
 
             _ => Err(Error::unsupported("deep data not supported yet")),
         }
+    }
+
+    /// Decompress the possibly compressed chunk into the start of
+    /// `decompressed_ne`, and return where the block is placed in the image.
+    ///
+    /// The bytes written are those that `decompress_chunk` returns as the
+    /// `data` of the block, in native-endian format: the pixel count of the
+    /// block times the bytes per pixel of the layer. A destination of
+    /// `Header::max_block_byte_size` bytes fits any block of that layer.
+    /// It is an error if the destination is too short.
+    ///
+    /// All temporary memory is meant to be taken from `scratch`, so that no
+    /// memory is allocated once it has grown to fit the largest block.
+    /// The decoders do not use it yet, and still allocate.
+    pub fn decompress_chunk_into(
+        chunk: ChunkRef<'_>,
+        meta_data: &MetaData,
+        pedantic: bool,
+        scratch: &mut DecodeScratch,
+        decompressed_ne: &mut [u8],
+    ) -> Result<BlockIndex> {
+        let (header, index, absolute_indices) =
+            Self::locate_block(chunk.layer_index, chunk.location, meta_data)?;
+
+        header.compression.decompress_image_section_from_le_into(
+            header,
+            chunk.compressed_pixels_le,
+            absolute_indices,
+            pedantic,
+            scratch,
+            decompressed_ne,
+        )?;
+
+        Ok(index)
+    }
+
+    /// Find the header of a block, its index, and its absolute pixel
+    /// coordinates, validating that the layer contains the block.
+    fn locate_block(
+        layer_index: usize,
+        location: BlockLocation,
+        meta_data: &MetaData,
+    ) -> Result<(&Header, BlockIndex, IntegerBounds)> {
+        let header: &Header = meta_data
+            .headers
+            .get(layer_index)
+            .ok_or_else(|| Error::invalid("chunk layer index"))?;
+
+        let tile_data_indices = match location {
+            BlockLocation::Tile(coordinates) => coordinates,
+            BlockLocation::ScanLine {
+                y_coordinate,
+            } => header.get_scan_line_block_tile_coordinates(y_coordinate)?,
+        };
+
+        let absolute_indices = header.get_absolute_block_pixel_coordinates(tile_data_indices)?;
+        absolute_indices.validate(Some(header.layer_size))?;
+
+        let index = BlockIndex {
+            layer: layer_index,
+            pixel_position: absolute_indices.position.to_usize("data indices start")?,
+            level: tile_data_indices.level_index,
+            pixel_size: absolute_indices.size,
+        };
+
+        Ok((header, index, absolute_indices))
     }
 
     /// Consume this block by compressing it, returning a `Chunk`.

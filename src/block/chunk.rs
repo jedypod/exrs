@@ -145,6 +145,119 @@ pub struct CompressedDeepTileBlock {
     pub compressed_sample_data_le: Vec<u8>,
 }
 
+/// A chunk of flat pixel data whose compressed bytes are borrowed,
+/// for example from the bytes of a file that is already in memory.
+///
+/// This is what [`Chunk`] is for flat data, without owning the bytes:
+/// reading one copies nothing and allocates nothing.
+/// Decompress it with `UncompressedBlock::decompress_chunk_into`.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkRef<'b> {
+    /// The index of the layer that the block belongs to.
+    pub layer_index: usize,
+
+    /// Where the block is located in that layer.
+    pub location: BlockLocation,
+
+    /// The pixels of the block, compressed and in little-endian format,
+    /// as they are stored in the file.
+    pub compressed_pixels_le: &'b [u8],
+}
+
+/// Locates a block of flat pixel data in its layer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum BlockLocation {
+    /// A scan line block, located by the pixel space y coordinate
+    /// of its top scan line.
+    ScanLine {
+        /// The pixel space y coordinate of the top scan line in the block.
+        y_coordinate: i32,
+    },
+
+    /// A tile.
+    Tile(TileCoordinates),
+}
+
+impl<'b> ChunkRef<'b> {
+    /// Read the chunk that starts at the beginning of the bytes, without
+    /// validating it, and advance the bytes to the end of that chunk.
+    /// The compressed pixels are borrowed from the bytes.
+    ///
+    /// Returns `Error::NotSupported` for a chunk of deep data.
+    pub fn read(bytes: &mut &'b [u8], meta_data: &MetaData) -> Result<Self> {
+        let mut remaining: &'b [u8] = bytes;
+
+        let layer_index = i32_to_usize(
+            if meta_data.requirements.is_multilayer() {
+                i32::read_le(&mut remaining)?
+            } else {
+                0_i32 // reference the first header for single-layer images
+            },
+            "chunk data part number",
+        )?;
+
+        let header = meta_data
+            .headers
+            .get(layer_index)
+            .ok_or_else(|| Error::invalid("chunk data part number"))?;
+
+        if header.deep {
+            return Err(Error::unsupported("deep data not supported yet"));
+        }
+
+        let (location, purpose) = match header.blocks {
+            BlockDescription::ScanLines => (
+                BlockLocation::ScanLine {
+                    y_coordinate: i32::read_le(&mut remaining)?,
+                },
+                "scan line block sample count",
+            ),
+            BlockDescription::Tiles(_) => (
+                BlockLocation::Tile(TileCoordinates::read(&mut remaining)?),
+                "tile block sample count",
+            ),
+        };
+
+        let byte_size = i32_to_usize(i32::read_le(&mut remaining)?, purpose)?;
+        if byte_size > header.max_block_byte_size() || byte_size > remaining.len() {
+            return Err(Error::invalid(purpose));
+        }
+
+        let (compressed_pixels_le, remaining) = remaining.split_at(byte_size);
+        *bytes = remaining;
+
+        Ok(Self {
+            layer_index,
+            location,
+            compressed_pixels_le,
+        })
+    }
+}
+
+impl Chunk {
+    /// Borrow this chunk. Returns `None` for a chunk of deep data.
+    pub fn as_flat_ref(&self) -> Option<ChunkRef<'_>> {
+        let (location, compressed_pixels_le) = match &self.compressed_block {
+            CompressedBlock::ScanLine(block) => (
+                BlockLocation::ScanLine {
+                    y_coordinate: block.y_coordinate,
+                },
+                &block.compressed_pixels_le,
+            ),
+            CompressedBlock::Tile(block) => {
+                (BlockLocation::Tile(block.coordinates), &block.compressed_pixels_le)
+            }
+            _ => return None,
+        };
+
+        Some(ChunkRef {
+            layer_index: self.layer_index,
+            location,
+            compressed_pixels_le,
+        })
+    }
+}
+
 use crate::io::*;
 
 impl TileCoordinates {

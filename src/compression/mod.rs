@@ -29,6 +29,29 @@ pub type ByteVec = Vec<u8>;
 /// A byte slice.
 pub type Bytes<'s> = &'s [u8];
 
+/// The temporary memory a decoder needs for one block.
+///
+/// Decoding a block with [`Compression::decompress_image_section_from_le_into`]
+/// borrows every buffer it needs from this value instead of allocating it.
+/// The buffers grow to fit the largest block decoded so far and are kept, so
+/// that decoding allocates nothing once a block of each size has been seen.
+///
+/// Create one with `DecodeScratch::default()`, which allocates nothing, and
+/// keep it for as long as blocks are being decoded: one per thread that
+/// decodes. Any scratch can decode any block of any file.
+#[derive(Default)]
+#[allow(missing_copy_implementations)] // will own buffers
+pub struct DecodeScratch {
+    // the decoders move their buffers here one by one
+    _buffers: (),
+}
+
+impl std::fmt::Debug for DecodeScratch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DecodeScratch").finish_non_exhaustive()
+    }
+}
+
 /// Specifies which compression method to use.
 ///
 /// Use uncompressed data for fastest loading and writing speeds.
@@ -280,17 +303,7 @@ impl Compression {
         pixel_section: IntegerBounds,
         pedantic: bool,
     ) -> Result<ByteVec> {
-        let max_tile_size = header.max_block_pixel_size();
-
-        assert!(
-            pixel_section.validate(Some(max_tile_size)).is_ok(),
-            "decompress tile coordinate bug"
-        );
-        if header.deep {
-            assert!(self.supports_deep_data());
-        }
-
-        let expected_byte_size = pixel_section.size.area() * header.channels.bytes_per_pixel; // FIXME this needs to account for subsampling anywhere
+        let expected_byte_size = self.validate_image_section(header, pixel_section);
 
         // note: always true where self == Uncompressed
         if compressed_le.len() == expected_byte_size {
@@ -374,6 +387,135 @@ impl Compression {
                 Err(Error::invalid("decompressed data"))
             }
         }
+    }
+
+    /// Decompress the image section from bytes of little-endian format
+    /// into the start of `decompressed_ne`, in native-endian format,
+    /// and return the number of bytes written, which is the pixel count
+    /// of the section times the bytes per pixel of the header.
+    ///
+    /// The bytes have the layout that `decompress_image_section_from_le`
+    /// returns. It is an error if `decompressed_ne` is too short.
+    ///
+    /// All temporary memory is meant to be taken from `scratch`, so that no
+    /// memory is allocated once the scratch has grown to fit the largest
+    /// section. The decoders do not use it yet, and still allocate.
+    pub fn decompress_image_section_from_le_into(
+        self,
+        header: &Header,
+        compressed_le: Bytes<'_>,
+        pixel_section: IntegerBounds,
+        pedantic: bool,
+        _scratch: &mut DecodeScratch,
+        decompressed_ne: &mut [u8],
+    ) -> Result<usize> {
+        let expected_byte_size = self.validate_image_section(header, pixel_section);
+        let channels = &header.channels;
+
+        let decompressed_ne = decompressed_ne
+            .get_mut(..expected_byte_size)
+            .ok_or_else(|| Error::invalid("decompressed block exceeds the destination size"))?;
+
+        // note: always true where self == Uncompressed
+        if compressed_le.len() == expected_byte_size {
+            // the compressed data was larger than the raw data, so the small
+            // raw data has been written
+            decompressed_ne.copy_from_slice(compressed_le);
+            convert_slice_little_endian_to_current(decompressed_ne, channels, pixel_section)?;
+            return Ok(expected_byte_size);
+        }
+
+        use self::Compression::*;
+        let result = match self {
+            // uncompressed data always has the expected size
+            Uncompressed => Err(Error::invalid("decompressed data")),
+            ZIP16 | ZIP1 => owned_decompression(decompressed_ne, |expected_byte_size| {
+                zip::decompress_bytes(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            RLE => owned_decompression(decompressed_ne, |expected_byte_size| {
+                rle::decompress_bytes(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            PIZ => owned_decompression(decompressed_ne, |expected_byte_size| {
+                piz::decompress(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            PXR24 => owned_decompression(decompressed_ne, |expected_byte_size| {
+                pxr24::decompress(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            B44 | B44A => owned_decompression(decompressed_ne, |expected_byte_size| {
+                b44::decompress(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            DWAA(_) | DWAB(_) => owned_decompression(decompressed_ne, |expected_byte_size| {
+                dwa::decompress(
+                    channels,
+                    compressed_le.to_vec(),
+                    pixel_section,
+                    expected_byte_size,
+                    pedantic,
+                )
+            }),
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "yet unimplemented compression method: {self}"
+                )));
+            }
+        };
+
+        // map all errors to compression errors
+        result.map_err(|decompression_error| match decompression_error {
+            Error::NotSupported(message) => Error::unsupported(format!(
+                "yet unimplemented compression special case ({message})"
+            )),
+
+            error => Error::invalid(format!("compressed {self:?} data ({error})")),
+        })?;
+
+        Ok(expected_byte_size)
+    }
+
+    /// The byte size of the uncompressed section.
+    /// Panics for a section that the header cannot contain.
+    fn validate_image_section(self, header: &Header, pixel_section: IntegerBounds) -> usize {
+        let max_tile_size = header.max_block_pixel_size();
+
+        assert!(
+            pixel_section.validate(Some(max_tile_size)).is_ok(),
+            "decompress tile coordinate bug"
+        );
+        if header.deep {
+            assert!(self.supports_deep_data());
+        }
+
+        pixel_section.size.area() * header.channels.bytes_per_pixel // FIXME this needs to account for subsampling anywhere
     }
 
     /// For scan line images and deep scan line images, one or more scan lines
@@ -486,6 +628,33 @@ fn convert_little_endian_to_current(
     reverse_block_endianness(&mut bytes, channels, rectangle)?;
 
     Ok(bytes)
+}
+
+#[allow(unused)] // allows the extra parameters to be unused
+fn convert_slice_little_endian_to_current(
+    bytes: &mut [u8],
+    channels: &ChannelList,
+    rectangle: IntegerBounds,
+) -> UnitResult {
+    #[cfg(target_endian = "big")]
+    reverse_block_endianness(bytes, channels, rectangle)?;
+
+    Ok(())
+}
+
+/// Runs a decompression method that returns its own vector,
+/// for the methods that do not yet decompress into a slice.
+fn owned_decompression(
+    decompressed_ne: &mut [u8],
+    decompress: impl FnOnce(usize) -> Result<ByteVec>,
+) -> UnitResult {
+    let bytes_ne = decompress(decompressed_ne.len())?;
+    if bytes_ne.len() != decompressed_ne.len() {
+        return Err(Error::invalid("decompressed data"));
+    }
+
+    decompressed_ne.copy_from_slice(&bytes_ne);
+    Ok(())
 }
 
 #[allow(unused)] // unused when on little endian system

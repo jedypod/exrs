@@ -58,6 +58,24 @@ impl std::fmt::Debug for DecodeScratch {
     }
 }
 
+thread_local! {
+    // The scratch of the functions that are not given one. Allocating
+    // memory is cheap, but faulting in fresh pages for every block is not.
+    static THREAD_SCRATCH: std::cell::Cell<DecodeScratch> =
+        std::cell::Cell::new(DecodeScratch::default());
+}
+
+/// Lend the scratch of this thread to the function, for the functions that
+/// are not given a scratch. A thread keeps its scratch until it exits.
+fn with_thread_scratch<T>(decode: impl FnOnce(&mut DecodeScratch) -> T) -> T {
+    THREAD_SCRATCH.with(|thread_scratch| {
+        let mut scratch = thread_scratch.take();
+        let result = decode(&mut scratch);
+        thread_scratch.set(scratch);
+        result
+    })
+}
+
 /// The first `length` elements of a reused buffer, growing it if it is
 /// shorter. The contents are whatever an earlier use left there.
 fn reused_slice<T: Copy + Default>(buffer: &mut Vec<T>, length: usize) -> &mut [T] {
@@ -352,6 +370,11 @@ impl Compression {
 
     /// Decompress the image section from bytes of little-endian format,
     /// returning native-endian format.
+    ///
+    /// The temporary memory of the decoder is kept by the calling thread
+    /// until the thread exits, so that the next section does not allocate
+    /// it again. Use `decompress_image_section_from_le_into` to decide
+    /// where that memory lives and when it is freed.
     pub fn decompress_image_section_from_le(
         self,
         header: &Header,
@@ -376,14 +399,16 @@ impl Compression {
         self.validate_compressed_size(compressed_le.len(), expected_byte_size)?;
 
         let mut decompressed_ne = vec![0_u8; expected_byte_size];
-        self.decompress_image_section_from_le_into(
-            header,
-            &compressed_le,
-            pixel_section,
-            pedantic,
-            &mut DecodeScratch::default(),
-            &mut decompressed_ne,
-        )?;
+        with_thread_scratch(|scratch| {
+            self.decompress_image_section_from_le_into(
+                header,
+                &compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                &mut decompressed_ne,
+            )
+        })?;
 
         Ok(decompressed_ne)
     }

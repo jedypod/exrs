@@ -135,6 +135,10 @@ pub fn enumerate_ordered_header_block_indices(
 impl UncompressedBlock {
     /// Decompress the possibly compressed chunk and returns an
     /// `UncompressedBlock`.
+    ///
+    /// The temporary memory of the decoder is kept by the calling thread
+    /// until the thread exits. Use `decompress_chunk_into` to decide where
+    /// that memory lives and when it is freed.
     // for uncompressed data, the ByteVec in the chunk is moved all the way
     #[inline]
     #[must_use]

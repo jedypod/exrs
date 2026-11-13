@@ -46,6 +46,8 @@ pub struct DecodeScratch {
     /// The bytes of a block before they are rearranged into the output
     /// layout, for the methods that have such a stage.
     packed_bytes: ByteVec,
+
+    b44_channels: Vec<b44::ChannelData>,
 }
 
 impl std::fmt::Debug for DecodeScratch {
@@ -459,15 +461,14 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
-            B44 | B44A => owned_decompression(decompressed_ne, |expected_byte_size| {
-                b44::decompress(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
+            B44 | B44A => b44::decompress_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                scratch,
+                decompressed_ne,
+            ),
             DWAA(_) | DWAB(_) => owned_decompression(decompressed_ne, |expected_byte_size| {
                 dwa::decompress(
                     channels,

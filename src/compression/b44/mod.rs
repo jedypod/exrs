@@ -7,8 +7,8 @@ use lebe::io::{ReadPrimitive, WriteEndian};
 use table::{EXP_TABLE, LOG_TABLE};
 
 use crate::{
-    compression::{mod_p, ByteVec},
-    error::usize_to_i32,
+    compression::{mod_p, reused_slice, ByteVec, Bytes, DecodeScratch},
+    error::{usize_to_i32, UnitResult},
     io::Data,
     meta::attribute::ChannelList,
     prelude::*,
@@ -239,8 +239,9 @@ fn unpack3(b: &[u8], s: &mut [u16; 16]) {
     s.fill(value); // All pixels have save value.
 }
 
+/// Where the samples of a channel are in the temporary buffer.
 #[derive(Debug)]
-struct ChannelData {
+pub(super) struct ChannelData {
     tmp_start_index: usize,
     tmp_end_index: usize,
     resolution: Vec2<usize>,
@@ -269,13 +270,15 @@ fn cpy_u8(src: &[u16], src_i: usize, dst: &mut [u8], dst_i: usize, n: usize) {
     memcpy_u16_to_u8(&src[src_i..src_i + n], &mut dst[dst_i..dst_i + 2 * n]);
 }
 
-pub fn decompress(
+pub fn decompress_into(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: Bytes<'_>,
     rectangle: IntegerBounds,
-    expected_byte_size: usize,
     _pedantic: bool,
-) -> Result<ByteVec> {
+    scratch: &mut DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    let expected_byte_size = decompressed_ne.len();
     debug_assert_eq!(
         expected_byte_size,
         rectangle.size.area() * channels.bytes_per_pixel,
@@ -285,11 +288,12 @@ pub fn decompress(
     debug_assert!(!channels.list.is_empty(), "no channels found");
 
     if compressed_le.is_empty() {
-        return Ok(Vec::new());
+        return Err(Error::invalid("decompressed data"));
     }
 
     // Extract channel information needed for decompression.
-    let mut channel_data: Vec<ChannelData> = Vec::with_capacity(channels.list.len());
+    let channel_data = &mut scratch.b44_channels;
+    channel_data.clear();
     let mut tmp_read_index = 0;
 
     for channel in &channels.list {
@@ -313,14 +317,16 @@ pub fn decompress(
     // Temporary buffer is used to decompress B44 datas the way they are stored
     // in the compressed buffer (channel by channel). We interleave the
     // final result later.
-    let mut tmp = Vec::with_capacity(expected_byte_size);
+    // Every byte of it is written below, so it needs no clearing.
+    debug_assert_eq!(tmp_read_index, expected_byte_size);
+    let tmp = reused_slice(&mut scratch.packed_bytes, tmp_read_index);
 
     // Index in the compressed buffer.
     let mut in_i = 0usize;
 
     let mut remaining_le = compressed_le.len();
 
-    for channel in &channel_data {
+    for channel in channel_data.iter() {
         debug_assert_eq!(remaining_le, compressed_le.len() - in_i);
 
         // Compute information for current channel.
@@ -337,7 +343,8 @@ pub fn decompress(
                 return Err(Error::invalid("not enough data"));
             }
 
-            tmp.extend_from_slice(&compressed_le[in_i..(in_i + byte_count)]);
+            tmp[channel.tmp_start_index..channel.tmp_start_index + byte_count]
+                .copy_from_slice(&compressed_le[in_i..(in_i + byte_count)]);
 
             in_i += byte_count;
             remaining_le -= byte_count;
@@ -349,9 +356,6 @@ pub fn decompress(
         // The rest of the code assume we are manipulating u16 (2 bytes) values.
         debug_assert_eq!(channel.sample_type, SampleType::F16);
         debug_assert_eq!(channel.sample_type.bytes_per_sample(), size_of::<u16>());
-
-        // Increase buffer to get new uncompressed datas.
-        tmp.resize(tmp.len() + byte_count, 0);
 
         let x_sample_count = channel.resolution.x() * channel.samples_per_pixel;
         let y_sample_count = channel.resolution.y() * channel.samples_per_pixel;
@@ -417,21 +421,21 @@ pub fn decompress(
 
                 // Copy rows (without going outside channel).
                 if y + 3 < y_sample_count {
-                    cpy_u8(&s, 0, &mut tmp, row0, x_resting_sample_count);
-                    cpy_u8(&s, 4, &mut tmp, row1, x_resting_sample_count);
-                    cpy_u8(&s, 8, &mut tmp, row2, x_resting_sample_count);
-                    cpy_u8(&s, 12, &mut tmp, row3, x_resting_sample_count);
+                    cpy_u8(&s, 0, tmp, row0, x_resting_sample_count);
+                    cpy_u8(&s, 4, tmp, row1, x_resting_sample_count);
+                    cpy_u8(&s, 8, tmp, row2, x_resting_sample_count);
+                    cpy_u8(&s, 12, tmp, row3, x_resting_sample_count);
                 } else {
                     debug_assert!(y < y_sample_count);
 
-                    cpy_u8(&s, 0, &mut tmp, row0, x_resting_sample_count);
+                    cpy_u8(&s, 0, tmp, row0, x_resting_sample_count);
 
                     if y + 1 < y_sample_count {
-                        cpy_u8(&s, 4, &mut tmp, row1, x_resting_sample_count);
+                        cpy_u8(&s, 4, tmp, row1, x_resting_sample_count);
                     }
 
                     if y + 2 < y_sample_count {
-                        cpy_u8(&s, 8, &mut tmp, row2, x_resting_sample_count);
+                        cpy_u8(&s, 8, tmp, row2, x_resting_sample_count);
                     }
                 }
 
@@ -444,13 +448,11 @@ pub fn decompress(
         }
     }
 
-    debug_assert_eq!(tmp.len(), expected_byte_size);
-
     // Interleave uncompressed channel data.
-    let mut out = Vec::with_capacity(expected_byte_size);
+    let mut remaining_out = &mut *decompressed_ne;
 
     for y in rectangle.position.y()..rectangle.end().y() {
-        for channel in &mut channel_data {
+        for channel in channel_data.iter_mut() {
             if mod_p(y, usize_to_i32(channel.y_sampling, "sampling")?) != 0 {
                 continue;
             }
@@ -463,6 +465,12 @@ pub fn decompress(
 
             channel.tmp_end_index = next_tmp_end_index;
 
+            if bytes_per_line > remaining_out.len() {
+                return Err(Error::invalid("decompressed data"));
+            }
+            let (out, rest) = std::mem::take(&mut remaining_out).split_at_mut(bytes_per_line);
+            remaining_out = rest;
+
             // TODO do not convert endianness for f16-only images
             //      see https://github.com/AcademySoftwareFoundation/openexr/blob/3bd93f85bcb74c77255f28cdbb913fdbfbb39dfe/OpenEXR/IlmImf/ImfTiledOutputFile.cpp#L750-L842
             // We can support uncompressed data in the machine's native format
@@ -472,14 +480,15 @@ pub fn decompress(
             if channel.sample_type == SampleType::F16 {
                 // TODO simplify this and make it memcpy on little endian
                 // systems https://github.com/AcademySoftwareFoundation/openexr/blob/a03aca31fa1ce85d3f28627dbb3e5ded9494724a/src/lib/OpenEXR/ImfB44Compressor.cpp#L943
-                for mut f16_bytes in channel_bytes.chunks(std::mem::size_of::<f16>()) {
-                    let native_endian_f16_bits =
-                        u16::read_from_little_endian(&mut f16_bytes).expect("memory read failed");
-                    out.write_as_native_endian(&native_endian_f16_bits)
-                        .expect("memory write failed");
+                for (f16_bytes, out) in channel_bytes
+                    .chunks_exact(std::mem::size_of::<f16>())
+                    .zip(out.chunks_exact_mut(std::mem::size_of::<f16>()))
+                {
+                    let native_endian_f16_bits = u16::from_le_bytes([f16_bytes[0], f16_bytes[1]]);
+                    out.copy_from_slice(&native_endian_f16_bits.to_ne_bytes());
                 }
             } else {
-                u8::write_slice_ne(&mut out, channel_bytes).expect("write to in-memory failed");
+                out.copy_from_slice(channel_bytes);
             }
         }
     }
@@ -491,11 +500,13 @@ pub fn decompress(
         );
     }
 
-    debug_assert_eq!(out.len(), expected_byte_size);
+    if !remaining_out.is_empty() {
+        return Err(Error::invalid("decompressed data"));
+    }
 
     // TODO do not convert endianness for f16-only images
     //      see https://github.com/AcademySoftwareFoundation/openexr/blob/3bd93f85bcb74c77255f28cdbb913fdbfbb39dfe/OpenEXR/IlmImf/ImfTiledOutputFile.cpp#L750-L842
-    super::convert_little_endian_to_current(out, channels, rectangle)
+    super::convert_slice_little_endian_to_current(decompressed_ne, channels, rectangle)
 }
 
 pub fn compress(
@@ -743,9 +754,16 @@ mod test {
 
         let compressed = b44::compress(&channels, pixel_bytes.clone(), rectangle, true).unwrap();
 
-        let decompressed =
-            b44::decompress(&channels, compressed.clone(), rectangle, pixel_bytes.len(), true)
-                .unwrap();
+        let mut decompressed = vec![0_u8; pixel_bytes.len()];
+        b44::decompress_into(
+            &channels,
+            &compressed,
+            rectangle,
+            true,
+            &mut crate::compression::DecodeScratch::default(),
+            &mut decompressed,
+        )
+        .unwrap();
 
         assert_eq!(decompressed.len(), pixel_bytes.len());
 

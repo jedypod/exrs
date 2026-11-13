@@ -1,8 +1,17 @@
 //! Decompressing a chunk into memory that the caller provides must produce
-//! the bytes that `UncompressedBlock::decompress_chunk` returns, and must
-//! refuse a destination that is too small and a chunk that is damaged.
+//! the bytes that `UncompressedBlock::decompress_chunk` returns, must not
+//! allocate once its scratch is warm, and must refuse a destination that is
+//! too small and sizes that a damaged chunk claims.
+//!
+//! A separate test binary, because it installs a global allocator that counts
+//! the allocations of each thread, and refuses any single allocation over
+//! 1 GiB, as a memory-constrained system would.
 
-use std::io::Cursor;
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+    io::Cursor,
+};
 
 use exr::{
     block::{
@@ -14,6 +23,60 @@ use exr::{
     prelude::*,
 };
 use smallvec::smallvec;
+
+struct Counting;
+
+const MAX_ALLOCATION: usize = 1 << 30;
+
+thread_local! {
+    static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn count_allocation(size: usize) {
+    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+    ALLOCATED_BYTES.with(|bytes| bytes.set(bytes.get() + size));
+}
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() > MAX_ALLOCATION {
+            return std::ptr::null_mut();
+        }
+        count_allocation(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if layout.size() > MAX_ALLOCATION {
+            return std::ptr::null_mut();
+        }
+        count_allocation(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if new_size > MAX_ALLOCATION {
+            return std::ptr::null_mut();
+        }
+        count_allocation(new_size);
+        unsafe { System.realloc(pointer, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// The number of allocations that this thread made in the function.
+fn count_allocations(function: impl FnOnce()) -> usize {
+    let before = ALLOCATION_COUNT.with(Cell::get);
+    function();
+    ALLOCATION_COUNT.with(Cell::get) - before
+}
 
 const ALL_COMPRESSIONS: [Compression; 10] = [
     Compression::Uncompressed,
@@ -175,6 +238,45 @@ fn a_borrowed_chunk_is_read_like_an_owned_chunk() {
         }
 
         assert!(remaining_bytes.is_empty());
+    }
+}
+
+#[test]
+fn decompressing_into_a_slice_does_not_allocate() {
+    for blocks in ALL_BLOCKS {
+        for compression in ALL_COMPRESSIONS {
+            let bytes = write_image(compression, blocks, Vec2(71, 277));
+            let (meta_data, chunks) = read_chunks(&bytes);
+
+            let mut chunk_bytes = Vec::new();
+            for chunk in &chunks {
+                chunk.write(&mut chunk_bytes, meta_data.headers.len()).unwrap();
+            }
+
+            let mut scratch = DecodeScratch::default();
+            let mut destination = vec![0_u8; meta_data.headers[0].max_block_byte_size()];
+
+            let mut decompress_all_chunks = || {
+                let mut remaining_bytes = chunk_bytes.as_slice();
+                while !remaining_bytes.is_empty() {
+                    let chunk = ChunkRef::read(&mut remaining_bytes, &meta_data).unwrap();
+                    UncompressedBlock::decompress_chunk_into(
+                        chunk,
+                        &meta_data,
+                        false,
+                        &mut scratch,
+                        &mut destination,
+                    )
+                    .unwrap();
+                }
+            };
+
+            // the first time, the scratch grows to fit the largest block
+            decompress_all_chunks();
+
+            let allocation_count = count_allocations(decompress_all_chunks);
+            assert_eq!(allocation_count, 0, "{} {:?} allocates when warm", compression, blocks);
+        }
     }
 }
 

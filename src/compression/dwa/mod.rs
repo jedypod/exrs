@@ -53,8 +53,8 @@ enum CompressorScheme {
 }
 
 /// The part of a channel name after the last '.'
-fn channel_suffix(name: &str) -> &str {
-    match name.rfind('.') {
+fn channel_suffix(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|&byte| byte == b'.') {
         Some(dot) => &name[dot + 1..],
         None => name,
     }
@@ -70,6 +70,26 @@ struct ChannelInfo {
     quantize_linearly: bool,
 }
 
+/// The channels that share the part of their name before the suffix,
+/// and which of them holds each slot of an R/G/B triplet.
+#[derive(Debug, Clone)]
+struct ChannelPrefix {
+    /// The first channel with this prefix.
+    channel: usize,
+    /// The number of bytes of that channel's name that are the prefix.
+    length: usize,
+    slots: [Option<usize>; 3],
+}
+
+/// The channels of a chunk as the compressor sees them, kept to classify
+/// the channels of the next chunk without allocating again.
+#[derive(Default)]
+struct ChannelClasses {
+    infos: Vec<ChannelInfo>,
+    prefixes: Vec<ChannelPrefix>,
+    csc_groups: Vec<[usize; 3]>,
+}
+
 /// Classify every channel and find the CSC'd R/G/B triplets, mirroring
 /// "DwaCompressor_classifyChannels": a prefix map (in order of first
 /// appearance, which determines group decode order) collects which channel
@@ -78,21 +98,37 @@ struct ChannelInfo {
 fn classify_channels(
     channels: &ChannelList,
     rectangle: IntegerBounds,
-    rules: &[Rule],
-) -> (Vec<ChannelInfo>, Vec<[usize; 3]>) {
+    rules: &[Rule<'_>],
+    classes: &mut ChannelClasses,
+) {
     // Match channel names against the rule table, then collect R/G/B triplets
     // in the order the prefixes first appear. That order controls how the
     // shared lossy streams are consumed later.
-    let mut infos = Vec::with_capacity(channels.list.len());
-    let mut prefix_map: Vec<(String, [Option<usize>; 3])> = Vec::new();
+    let ChannelClasses {
+        infos,
+        prefixes,
+        csc_groups,
+    } = classes;
+
+    infos.clear();
+    prefixes.clear();
+    csc_groups.clear();
+
+    let prefix_bytes = |prefix: &ChannelPrefix| -> &[u8] {
+        &channels.list[prefix.channel].name.bytes()[..prefix.length]
+    };
 
     for (index, channel) in channels.list.iter().enumerate() {
-        let name = channel.name.to_string();
-        let suffix = channel_suffix(&name);
+        let name = channel.name.bytes();
+        let suffix = channel_suffix(name);
         let prefix = &name[..name.len() - suffix.len()];
 
-        if !prefix_map.iter().any(|(known, _)| known == prefix) {
-            prefix_map.push((prefix.to_string(), [None; 3]));
+        if !prefixes.iter().any(|known| prefix_bytes(known) == prefix) {
+            prefixes.push(ChannelPrefix {
+                channel: index,
+                length: prefix.len(),
+                slots: [None; 3],
+            });
         }
 
         let mut scheme = CompressorScheme::Unknown;
@@ -100,9 +136,9 @@ fn classify_channels(
             if rule.matches(suffix, channel.sample_type) {
                 scheme = rule.scheme;
                 if let Some(csc_index) = rule.csc_index {
-                    for (known, slots) in &mut prefix_map {
-                        if known == prefix {
-                            slots[csc_index] = Some(index);
+                    for known in prefixes.iter_mut() {
+                        if prefix_bytes(known) == prefix {
+                            known.slots[csc_index] = Some(index);
                         }
                     }
                 }
@@ -121,21 +157,16 @@ fn classify_channels(
         });
     }
 
-    let csc_groups = prefix_map
-        .into_iter()
-        .filter_map(|(_, slots)| {
-            let [Some(r), Some(g), Some(b)] = slots else {
-                return None;
-            };
-            let all_lossy =
-                [r, g, b].iter().all(|&index| infos[index].scheme == CompressorScheme::LossyDct);
-            let same_sampling = channels.list[r].sampling == channels.list[g].sampling
-                && channels.list[r].sampling == channels.list[b].sampling;
-            (all_lossy && same_sampling).then_some([r, g, b])
-        })
-        .collect();
-
-    (infos, csc_groups)
+    csc_groups.extend(prefixes.iter().filter_map(|prefix| {
+        let [Some(r), Some(g), Some(b)] = prefix.slots else {
+            return None;
+        };
+        let all_lossy =
+            [r, g, b].iter().all(|&index| infos[index].scheme == CompressorScheme::LossyDct);
+        let same_sampling = channels.list[r].sampling == channels.list[g].sampling
+            && channels.list[r].sampling == channels.list[b].sampling;
+        (all_lossy && same_sampling).then_some([r, g, b])
+    }));
 }
 
 pub fn compress(
@@ -155,7 +186,9 @@ pub fn compress(
     // header + rules, then UNKNOWN, AC, DC and RLE payloads.
     let rules = default_channel_rules();
     let rule_bytes = write_relevant_channel_rules(&rules, channels)?;
-    let (channel_infos, csc_groups) = classify_channels(channels, rectangle, &rules);
+    let mut classes = ChannelClasses::default();
+    classify_channels(channels, rectangle, &rules, &mut classes);
+    let (channel_infos, csc_groups) = (classes.infos, classes.csc_groups);
     let channel_bytes =
         split_scanline_channels(&uncompressed_le, channels, &channel_infos, rectangle)?;
 
@@ -256,7 +289,9 @@ pub fn decompress(
         parse_channel_rules(&mut input)?
     };
 
-    let (channel_infos, csc_groups) = classify_channels(channels, rectangle, &rules);
+    let mut classes = ChannelClasses::default();
+    classify_channels(channels, rectangle, &rules, &mut classes);
+    let (channel_infos, csc_groups) = (classes.infos, classes.csc_groups);
 
     if channel_infos.iter().any(|info| {
         info.scheme == CompressorScheme::LossyDct && info.sample_type == SampleType::U32

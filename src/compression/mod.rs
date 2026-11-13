@@ -308,85 +308,28 @@ impl Compression {
         // note: always true where self == Uncompressed
         if compressed_le.len() == expected_byte_size {
             // the compressed data was larger than the raw data, so the small
-            // raw data has been written
-            convert_little_endian_to_current(compressed_le, &header.channels, pixel_section)
-        } else {
-            use self::Compression::*;
-            let bytes_ne = match self {
-                Uncompressed => {
-                    convert_little_endian_to_current(compressed_le, &header.channels, pixel_section)
-                }
-                ZIP16 => zip::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                ZIP1 => zip::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                RLE => rle::decompress_bytes(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                PIZ => piz::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                PXR24 => pxr24::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                B44 | B44A => b44::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                DWAA(_) | DWAB(_) => dwa::decompress(
-                    &header.channels,
-                    compressed_le,
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                ),
-                _ => {
-                    return Err(Error::unsupported(format!(
-                        "yet unimplemented compression method: {self}"
-                    )));
-                }
-            };
-
-            // map all errors to compression errors
-            let bytes_ne = bytes_ne.map_err(|decompression_error| match decompression_error {
-                Error::NotSupported(message) => Error::unsupported(format!(
-                    "yet unimplemented compression special case ({message})"
-                )),
-
-                error => Error::invalid(format!("compressed {self:?} data ({error})")),
-            })?;
-
-            if bytes_ne.len() == expected_byte_size {
-                Ok(bytes_ne)
-            } else {
-                Err(Error::invalid("decompressed data"))
-            }
+            // raw data has been written: the bytes are moved all the way
+            return convert_little_endian_to_current(
+                compressed_le,
+                &header.channels,
+                pixel_section,
+            );
         }
+
+        // the size comes from the header: do not allocate what cannot be filled
+        self.validate_compressed_size(compressed_le.len(), expected_byte_size)?;
+
+        let mut decompressed_ne = vec![0_u8; expected_byte_size];
+        self.decompress_image_section_from_le_into(
+            header,
+            &compressed_le,
+            pixel_section,
+            pedantic,
+            &mut DecodeScratch::default(),
+            &mut decompressed_ne,
+        )?;
+
+        Ok(decompressed_ne)
     }
 
     /// Decompress the image section from bytes of little-endian format
@@ -424,6 +367,8 @@ impl Compression {
             convert_slice_little_endian_to_current(decompressed_ne, channels, pixel_section)?;
             return Ok(expected_byte_size);
         }
+
+        self.validate_compressed_size(compressed_le.len(), expected_byte_size)?;
 
         use self::Compression::*;
         let result = match self {
@@ -500,6 +445,52 @@ impl Compression {
         })?;
 
         Ok(expected_byte_size)
+    }
+
+    /// Refuse a section that is larger than any that so few compressed bytes
+    /// can decompress to. The size of a section comes from the header, and a
+    /// damaged header can claim any size, so this is checked before making
+    /// room for the section.
+    fn validate_compressed_size(
+        self,
+        compressed_byte_size: usize,
+        expected_byte_size: usize,
+    ) -> UnitResult {
+        // deflate codes at most 258 bytes with two bits
+        const ZIP: usize = 1032;
+
+        use self::Compression::*;
+        let max_expansion = match self {
+            // a token of two bytes repeats a byte at most 128 times
+            RLE => 64,
+
+            ZIP1 | ZIP16 => ZIP,
+
+            // decoding widens three inflated bytes to an `f32`
+            PXR24 => ZIP * 2,
+
+            // a bit decodes to at most 29 values of two bytes
+            PIZ => 8 * 29 * 2,
+
+            // three bytes unpack to at most 16 values of two bytes
+            B44 | B44A => 11,
+
+            // an empty chunk decodes to zeros
+            DWAA(_) | DWAB(_) if compressed_byte_size == 0 => return Ok(()),
+
+            // two inflated bytes hold the DC value of a block of 64 samples
+            // of up to four bytes, with any number of AC values being zero
+            DWAA(_) | DWAB(_) => ZIP * 128,
+
+            // not stored raw, or not implemented, which is reported later
+            Uncompressed | HTJ2K32 | HTJ2K256 => return Ok(()),
+        };
+
+        if expected_byte_size > compressed_byte_size.saturating_mul(max_expansion) {
+            return Err(Error::invalid("block size exceeds what its data can decompress to"));
+        }
+
+        Ok(())
     }
 
     /// The byte size of the uncompressed section.

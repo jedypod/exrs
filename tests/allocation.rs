@@ -103,3 +103,68 @@ fn assert_flat_and_rgba_reads_fail(path: &str) {
     );
     assert!(rgba.is_err());
 }
+
+/// The size of a block follows from the data window in the header. A damaged
+/// data window can claim blocks of any size, which must not be allocated
+/// before the compressed data is found to be far too short to fill them.
+#[test]
+fn huge_block_is_an_error_before_allocating() {
+    use std::{convert::TryInto, io::Cursor};
+
+    use exr::block::{chunk::Chunk, UncompressedBlock};
+
+    let compressions = [
+        Compression::RLE,
+        Compression::ZIP1,
+        Compression::ZIP16,
+        Compression::PIZ,
+        Compression::PXR24,
+        Compression::B44,
+        Compression::DWAA(None),
+    ];
+
+    for compression in compressions {
+        let size = Vec2(64, 40);
+        let image = Image::from_layer(Layer::new(
+            size,
+            LayerAttributes::named("wide"),
+            Encoding {
+                compression,
+                blocks: Blocks::ScanLines,
+                line_order: LineOrder::Increasing,
+            },
+            SpecificChannels::rgb(|position: Vec2<usize>| {
+                (position.x() as f32, position.y() as f32, 0.5_f32)
+            }),
+        ));
+
+        let mut bytes = Vec::new();
+        image.write().non_parallel().to_buffered(Cursor::new(&mut bytes)).unwrap();
+
+        // the attribute is its name, its type, the value size, and the
+        // value: the minimum x and y, and then the maximum x and y
+        let attribute_start = b"dataWindow\0box2i\0\x10\0\0\0";
+        let value_position = bytes
+            .windows(attribute_start.len())
+            .position(|window| window == attribute_start)
+            .expect("the writer should store the data window")
+            + attribute_start.len();
+
+        let max_x = &mut bytes[value_position + 8..value_position + 12];
+        assert_eq!(i32::from_le_bytes((&*max_x).try_into().unwrap()), 63);
+        max_x.copy_from_slice(&400_000_000_i32.to_le_bytes());
+
+        // a block now claims 400 million pixels in each scan line,
+        // far beyond what the allocator of this test hands out
+        let reader = exr::block::read(Cursor::new(&bytes), false).unwrap();
+        let meta_data = reader.meta_data().clone();
+        assert!(meta_data.headers[0].max_block_byte_size() > MAX_ALLOCATION);
+
+        let chunks: Vec<Chunk> = reader.all_chunks(false).unwrap().collect::<Result<_>>().unwrap();
+
+        for chunk in chunks {
+            let result = UncompressedBlock::decompress_chunk(chunk, &meta_data, false);
+            assert!(result.is_err(), "{} should refuse a huge block", compression);
+        }
+    }
+}

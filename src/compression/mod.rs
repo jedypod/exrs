@@ -48,6 +48,7 @@ pub struct DecodeScratch {
     packed_bytes: ByteVec,
 
     b44_channels: Vec<b44::ChannelData>,
+    piz: piz::DecodeScratch,
 }
 
 impl std::fmt::Debug for DecodeScratch {
@@ -444,15 +445,14 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
-            PIZ => owned_decompression(decompressed_ne, |expected_byte_size| {
-                piz::decompress(
-                    channels,
-                    compressed_le.to_vec(),
-                    pixel_section,
-                    expected_byte_size,
-                    pedantic,
-                )
-            }),
+            PIZ => piz::decompress_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                &mut scratch.piz,
+                decompressed_ne,
+            ),
             PXR24 => pxr24::decompress_into(
                 channels,
                 compressed_le,

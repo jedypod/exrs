@@ -8,8 +8,8 @@ mod wavelet;
 use std::convert::TryFrom;
 
 use crate::{
-    compression::{mod_p, ByteVec, Bytes},
-    error::{usize_to_i32, usize_to_u16},
+    compression::{mod_p, reused_slice, ByteVec, Bytes},
+    error::{usize_to_i32, usize_to_u16, UnitResult},
     io::Data,
     meta::attribute::*,
     prelude::*,
@@ -28,27 +28,41 @@ struct ChannelData {
     samples_per_pixel: usize,
 }
 
-pub fn decompress(
+/// The buffers of the decoder, kept to decode the next block without
+/// allocating them again.
+#[derive(Default)]
+pub struct DecodeScratch {
+    bitmap: Vec<u8>,
+    lookup_table: Vec<u16>,
+    u16_buffer: Vec<u16>,
+    channel_data: Vec<ChannelData>,
+    huffman: huffman::DecodeScratch,
+}
+
+pub fn decompress_into(
     channels: &ChannelList,
-    compressed_le: ByteVec,
+    compressed_le: Bytes<'_>,
     rectangle: IntegerBounds,
-    expected_byte_size: usize, /* TODO remove expected byte size as it can be computed with
-                                * `rectangle.size.area() * channels.bytes_per_pixel` */
     pedantic: bool,
-) -> Result<ByteVec> {
+    scratch: &mut DecodeScratch,
+    decompressed_ne: &mut [u8],
+) -> UnitResult {
+    let expected_byte_size = decompressed_ne.len();
     let expected_u16_count = expected_byte_size / 2;
     debug_assert_eq!(expected_byte_size, rectangle.size.area() * channels.bytes_per_pixel);
     debug_assert!(!channels.list.is_empty());
 
     if compressed_le.is_empty() {
-        return Ok(Vec::new());
+        return Err(Error::invalid("decompressed data"));
     }
 
     debug_assert_ne!(expected_u16_count, 0);
 
-    let mut bitmap = vec![0_u8; BITMAP_SIZE]; // FIXME use bit_vec!
+    // FIXME use bit_vec!
+    let bitmap = reused_slice(&mut scratch.bitmap, BITMAP_SIZE);
+    bitmap.fill(0);
 
-    let mut remaining_input_le = compressed_le.as_slice();
+    let mut remaining_input_le = compressed_le;
     let min_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
     let max_non_zero = u16::read_le(&mut remaining_input_le)? as usize;
 
@@ -60,7 +74,8 @@ pub fn decompress(
         u8::read_slice_ne(&mut remaining_input_le, &mut bitmap[min_non_zero..=max_non_zero])?;
     }
 
-    let (lookup_table, max_value) = reverse_lookup_table_from_bitmap(&bitmap);
+    let lookup_table = reused_slice(&mut scratch.lookup_table, U16_RANGE);
+    let max_value = reverse_lookup_table_from_bitmap(bitmap, lookup_table);
 
     {
         let length = i32::read_le(&mut remaining_input_le)?;
@@ -70,34 +85,33 @@ pub fn decompress(
         }
     }
 
-    let mut tmp_u16_buffer = huffman::decompress(remaining_input_le, expected_u16_count)?;
+    let tmp_u16_buffer = reused_slice(&mut scratch.u16_buffer, expected_u16_count);
+    huffman::decompress_into(remaining_input_le, &mut scratch.huffman, tmp_u16_buffer)?;
 
-    let mut channel_data: SmallVec<[ChannelData; 6]> = {
+    let channel_data = &mut scratch.channel_data;
+    channel_data.clear();
+
+    {
         let mut tmp_read_index = 0;
 
-        let channel_data = channels
-            .list
-            .iter()
-            .map(|channel| {
-                let channel_data = ChannelData {
-                    tmp_start_index: tmp_read_index,
-                    tmp_end_index: tmp_read_index,
-                    y_sampling: channel.sampling.y(),
-                    resolution: channel.subsampled_resolution(rectangle.size),
-                    samples_per_pixel: channel.sample_type.bytes_per_sample()
-                        / SampleType::F16.bytes_per_sample(),
-                };
+        channel_data.extend(channels.list.iter().map(|channel| {
+            let channel_data = ChannelData {
+                tmp_start_index: tmp_read_index,
+                tmp_end_index: tmp_read_index,
+                y_sampling: channel.sampling.y(),
+                resolution: channel.subsampled_resolution(rectangle.size),
+                samples_per_pixel: channel.sample_type.bytes_per_sample()
+                    / SampleType::F16.bytes_per_sample(),
+            };
 
-                tmp_read_index += channel_data.resolution.area() * channel_data.samples_per_pixel;
-                channel_data
-            })
-            .collect();
+            tmp_read_index += channel_data.resolution.area() * channel_data.samples_per_pixel;
+            channel_data
+        }));
 
         debug_assert_eq!(tmp_read_index, expected_u16_count);
-        channel_data
-    };
+    }
 
-    for channel in &channel_data {
+    for channel in channel_data.iter() {
         let u16_count = channel.resolution.area() * channel.samples_per_pixel;
         let u16s =
             &mut tmp_u16_buffer[channel.tmp_start_index..channel.tmp_start_index + u16_count];
@@ -114,14 +128,12 @@ pub fn decompress(
     }
 
     // Expand the pixel data to their original range
-    apply_lookup_table(&mut tmp_u16_buffer, &lookup_table);
+    apply_lookup_table(tmp_u16_buffer, lookup_table);
 
-    // let out_buffer_size = (max_scan_line_size * scan_line_count) + 65536 +
-    // 8192; // TODO not use expected byte size?
-    let mut out = Vec::with_capacity(expected_byte_size);
+    let mut remaining_out = &mut *decompressed_ne;
 
     for y in rectangle.position.y()..rectangle.end().y() {
-        for channel in &mut channel_data {
+        for channel in channel_data.iter_mut() {
             if mod_p(y, usize_to_i32(channel.y_sampling, "sampling factor")?) != 0 {
                 continue;
             }
@@ -136,7 +148,8 @@ pub fn decompress(
             // We can support uncompressed data in the machine's native format
             // if all image channels are of type HALF, and if the Xdr and the
             // native representations of a half have the same size.
-            u16::write_slice_le(&mut out, values).expect("write to in-memory failed");
+            u16::write_slice_le(&mut remaining_out, values)
+                .map_err(|_| Error::invalid("decompressed data"))?;
         }
     }
 
@@ -145,12 +158,15 @@ pub fn decompress(
     }
 
     debug_assert_eq!(channel_data.last().unwrap().tmp_end_index, tmp_u16_buffer.len());
-    debug_assert_eq!(out.len(), expected_byte_size);
+
+    if !remaining_out.is_empty() {
+        return Err(Error::invalid("decompressed data"));
+    }
 
     // TODO optimize for when all channels are f16!
     //      we should be able to omit endianness conversions in that case
     //      see https://github.com/AcademySoftwareFoundation/openexr/blob/3bd93f85bcb74c77255f28cdbb913fdbfbb39dfe/OpenEXR/IlmImf/ImfTiledOutputFile.cpp#L750-L842
-    super::convert_little_endian_to_current(out, channels, rectangle)
+    super::convert_slice_little_endian_to_current(decompressed_ne, channels, rectangle)
 }
 
 pub fn compress(
@@ -283,24 +299,26 @@ pub fn forward_lookup_table_from_bitmap(bitmap: &[u8]) -> (u16, Vec<u16>) {
     (usize_to_u16(count - 1, "piz count").unwrap(), table)
 }
 
-fn reverse_lookup_table_from_bitmap(bitmap: Bytes<'_>) -> (Vec<u16>, u16) {
-    let mut table = Vec::with_capacity(U16_RANGE);
+/// Fill the table, which has an entry for every `u16`,
+/// and return the largest value that has a table entry of its own.
+fn reverse_lookup_table_from_bitmap(bitmap: Bytes<'_>, table: &mut [u16]) -> u16 {
+    debug_assert_eq!(table.len(), U16_RANGE);
+    let mut count = 0;
 
     for index in 0..U16_RANGE {
-        // cannot use iter because filter removes capacity sizehint
         if index == 0 || ((bitmap[index >> 3] as usize & (1 << (index & 7))) != 0) {
-            table.push(usize_to_u16(index, "table entry").unwrap());
+            table[count] = usize_to_u16(index, "table entry").unwrap();
+            count += 1;
         }
     }
 
-    debug_assert!(!table.is_empty());
-    let max_value = usize_to_u16(table.len() - 1, "table size").unwrap();
+    debug_assert_ne!(count, 0);
+    let max_value = usize_to_u16(count - 1, "table size").unwrap();
 
     // fill remaining up to u16 range
-    assert!(table.len() <= U16_RANGE);
-    table.resize(U16_RANGE, 0);
+    table[count..].fill(0);
 
-    (table, max_value)
+    max_value
 }
 
 fn apply_lookup_table(data: &mut [u16], table: &[u16]) {
@@ -327,8 +345,16 @@ mod test {
             .collect();
 
         let compressed = piz::compress(&channels, pixel_bytes.clone(), rectangle).unwrap();
-        let decompressed =
-            piz::decompress(&channels, compressed, rectangle, pixel_bytes.len(), true).unwrap();
+        let mut decompressed = vec![0_u8; pixel_bytes.len()];
+        piz::decompress_into(
+            &channels,
+            &compressed,
+            rectangle,
+            true,
+            &mut piz::DecodeScratch::default(),
+            &mut decompressed,
+        )
+        .unwrap();
 
         assert_eq!(pixel_bytes, decompressed);
     }

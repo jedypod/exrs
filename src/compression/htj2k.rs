@@ -87,13 +87,19 @@ const DECOMPOSITION_LEVELS: u32 = 5;
 /// The code-block size `OpenEXR` codes, width and height.
 const BLOCK_SIZE: (u32, u32) = (128, 32);
 
+/// The code of the `htj2k` encoder's error for a codestream longer than
+/// its output limit allows, which the crate does not export.
+const OUTPUT_LIMIT_ERROR: u32 = 0x0008_0070;
+
 /// Compresses one chunk of native-endian samples, in the usual layout (see
 /// [`decompress_into`]), into little-endian bytes: the chunk header and an
 /// HTJ2K codestream, coded as `OpenEXR`'s `ht_apply_impl` codes it.
 ///
-/// The result may be larger than the samples; the caller stores the
-/// samples instead then, as `OpenEXR` does. `None` asks the caller to store
-/// them in any case: see [`must_store_raw`].
+/// `None` asks the caller to store the samples instead: where the coded
+/// chunk would not be smaller than the samples, as `OpenEXR` stores them
+/// then, and where [`must_store_raw`] says so. The encoder notices the
+/// former as soon as the codestream outgrows the samples, and stops there
+/// rather than code the rest of the chunk for nothing.
 ///
 /// `chunk_lines` is the height of a full chunk: 32 for `HTJ2K32` and 256
 /// for `HTJ2K256`, or the tile height.
@@ -105,6 +111,21 @@ pub fn compress(
     uncompressed: &[u8],
     rectangle: IntegerBounds,
     chunk_lines: usize,
+) -> Result<Option<ByteVec>> {
+    // OpenEXR keeps the coded chunk only if it is smaller than the samples
+    // (`packed < unpacked`), and `compress_image_section_to_le` does too.
+    let max_size = uncompressed.len().saturating_sub(1);
+    compress_within(channels, uncompressed, rectangle, chunk_lines, max_size)
+}
+
+/// [`compress`], which gives `None` where the coded chunk, header and
+/// codestream, would be longer than `max_size` bytes.
+fn compress_within(
+    channels: &ChannelList,
+    uncompressed: &[u8],
+    rectangle: IntegerBounds,
+    chunk_lines: usize,
+    max_size: usize,
 ) -> Result<Option<ByteVec>> {
     for channel in &channels.list {
         let Vec2(x, y) = channel.sampling;
@@ -149,15 +170,57 @@ pub fn compress(
     let mut compressed = Vec::with_capacity(uncompressed.len());
     write_chunk_header(&mut compressed, &file_channels)?;
 
-    let mut encoder =
-        new_encoder(channels, &file_channels, rgb, planar, image_size).map_err(encoder_error)?;
-    encoder.write_headers(&mut compressed, &[]).map_err(encoder_error)?;
+    // The codestream may take what the chunk header leaves of `max_size`.
+    // Where that is nothing, a limit of 0 still lets the encoder check the
+    // parameters, in the setters and then in `write_headers`, before it
+    // stops, so refused parameters stay errors.
+    let codestream_limit = max_size.saturating_sub(compressed.len());
+    let codestream_limit = u64::try_from(codestream_limit).unwrap_or(u64::MAX);
+    let mut encoder = new_encoder(channels, &file_channels, rgb, planar, image_size)
+        .and_then(|mut encoder| encoder.set_output_limit(codestream_limit).map(|()| encoder))
+        .map_err(encoder_error)?;
+
+    let outcome = encode_samples(
+        &mut encoder,
+        &mut compressed,
+        channels,
+        uncompressed,
+        &layout,
+        &file_channels,
+    )?;
+    match outcome {
+        Ok(()) => Ok(Some(compressed)),
+        Err(error) if error.code() == OUTPUT_LIMIT_ERROR => Ok(None),
+        Err(error) => Err(encoder_error(error)),
+    }
+}
+
+/// Codes the samples of a chunk with `encoder`, which is set up for it,
+/// and appends the codestream to `compressed`. Gives the errors of the
+/// checks here in the outer result and those of the encoder, among them
+/// [`OUTPUT_LIMIT_ERROR`], in the inner one.
+fn encode_samples(
+    encoder: &mut Encoder,
+    compressed: &mut ByteVec,
+    channels: &ChannelList,
+    uncompressed: &[u8],
+    layout: &[ChannelLayout],
+    file_channels: &[usize],
+) -> Result<::htj2k::Result<()>> {
+    if let Err(error) = encoder.write_headers(compressed, &[]) {
+        return Ok(Err(error));
+    }
 
     // The encoder asks for the lines in the order it codes them: planar,
     // all the lines of one component after the other, or else one line of
     // each component in turn.
     let mut next_line = vec![0_usize; file_channels.len()];
-    while let Some((component, line)) = encoder.exchange().map_err(encoder_error)? {
+    loop {
+        let (component, line) = match encoder.exchange() {
+            Ok(Some(next)) => next,
+            Ok(None) => break,
+            Err(error) => return Ok(Err(error)),
+        };
         let component = component as usize;
         let file_channel = file_channels[component];
         let sample_type = channels.list[file_channel].sample_type;
@@ -176,9 +239,8 @@ pub fn compress(
         let size = sample_type.bytes_per_sample() * channel_layout.width;
         read_samples(line, &uncompressed[start..start + size], sample_type);
     }
-    encoder.flush(&mut compressed).map_err(encoder_error)?;
 
-    Ok(Some(compressed))
+    Ok(encoder.flush(compressed))
 }
 
 /// Whether the chunks must be stored uncompressed because a channel's y
@@ -727,6 +789,128 @@ mod test {
         // the second triplet counts when the first is incomplete
         let words = [("R", H, 1), ("x.blue", F, 1), ("x.green", F, 1), ("x.red", F, 1)];
         assert_eq!(map(&words), (true, vec![3, 2, 1, 0]));
+    }
+
+    /// One channel `Y` of `sample_type` and `sampling`, `width` x `height`
+    /// at the origin, and its native-endian samples: `noise_bits` low bits
+    /// of noise over a ramp, so that more of them code to more bytes.
+    fn noisy_chunk(
+        sample_type: SampleType,
+        sampling: usize,
+        width: usize,
+        height: usize,
+        noise_bits: u32,
+    ) -> (ChannelList, IntegerBounds, Vec<u8>) {
+        let channels = ChannelList::new(smallvec::smallvec![ChannelDescription {
+            name: "Y".into(),
+            sample_type,
+            quantize_linearly: false,
+            sampling: Vec2(sampling, sampling),
+        }]);
+        let rectangle = IntegerBounds::new(Vec2(0, 0), Vec2(width, height));
+        let count = width.div_ceil(sampling) * height.div_ceil(sampling);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ u64::from(noise_bits);
+        let mut samples = Vec::new();
+        for index in 0..count {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let noise = u32::try_from(state & ((1_u64 << noise_bits) - 1)).unwrap();
+            let ramp = u32::try_from(index).unwrap() << 12;
+            let bits = 0x3c00_0000_u32.wrapping_add(ramp) ^ noise;
+            match sample_type {
+                SampleType::F16 => samples.extend_from_slice(&((bits >> 16) as u16).to_ne_bytes()),
+                _ => samples.extend_from_slice(&bits.to_ne_bytes()),
+            }
+        }
+        (channels, rectangle, samples)
+    }
+
+    /// The chunk coded without a size limit.
+    fn coded_without_limit(
+        channels: &ChannelList,
+        rectangle: IntegerBounds,
+        samples: &[u8],
+    ) -> ByteVec {
+        compress_within(channels, samples, rectangle, 32, usize::MAX).unwrap().unwrap()
+    }
+
+    /// The encoder's output limit stops a chunk one byte longer than
+    /// allowed, and leaves one that fits exactly as it is without a limit:
+    /// for smooth and noisy, HALF and FLOAT, and planar chunks.
+    #[test]
+    fn a_coded_chunk_fits_a_limit_of_its_size_exactly() {
+        let chunks = [
+            noisy_chunk(H, 1, 40, 32, 0),
+            noisy_chunk(F, 1, 61, 32, 12),
+            noisy_chunk(F, 1, 37, 32, 32),
+            noisy_chunk(H, 2, 64, 32, 8),
+            noisy_chunk(F, 1, 1, 1, 0),
+        ];
+        for (channels, rectangle, samples) in chunks {
+            let coded = coded_without_limit(&channels, rectangle, &samples);
+            let size = coded.len();
+            let within =
+                |max_size| compress_within(&channels, &samples, rectangle, 32, max_size).unwrap();
+            assert_eq!(within(size), Some(coded), "{rectangle:?}");
+            assert_eq!(within(size - 1), None, "{rectangle:?}");
+            // the limit leaves no room for the codestream, or none at all
+            assert_eq!(within(10), None);
+            assert_eq!(within(0), None);
+        }
+    }
+
+    /// `compress` keeps a coded chunk only if it is smaller than the
+    /// samples, as `OpenEXR` does: chunks whose coded size is the size of
+    /// the samples less one byte, the same, and one byte more. The first
+    /// assertion checks that each chunk still lands there.
+    #[test]
+    fn a_coded_chunk_is_kept_only_if_smaller_than_the_samples() {
+        // (noise bits, width, height, coded size less the size of the samples)
+        let cases = [
+            (21, 21, 16, -1),
+            (24, 82, 7, -1),
+            (17, 15, 16, 0),
+            (19, 43, 7, 0),
+            (23, 13, 32, 1),
+            (18, 39, 7, 1),
+        ];
+        for (noise_bits, width, height, difference) in cases {
+            let (channels, rectangle, samples) = noisy_chunk(F, 1, width, height, noise_bits);
+            let coded = coded_without_limit(&channels, rectangle, &samples);
+            let expected_size = samples.len().checked_add_signed(difference);
+            assert_eq!(Some(coded.len()), expected_size, "{rectangle:?}");
+
+            let expected = (difference < 0).then_some(coded);
+            assert_eq!(compress(&channels, &samples, rectangle, 32).unwrap(), expected);
+        }
+    }
+
+    /// Parameters that the encoder refuses are an error even where the
+    /// limit leaves no room for the codestream, rather than a chunk to
+    /// store raw: here a sampling of 256, which a SIZ marker cannot hold.
+    /// (The encoder refuses it as it is set; those `write_headers` refuses,
+    /// it refuses before it looks at the limit, but exrs refuses all of
+    /// them that it could reach first.)
+    #[test]
+    fn refused_parameters_are_an_error_whatever_the_limit() {
+        let channel = |name: &str, sampling| ChannelDescription {
+            name: name.into(),
+            sample_type: H,
+            quantize_linearly: false,
+            sampling: Vec2(1, sampling),
+        };
+        let channels = ChannelList::new(smallvec::smallvec![channel("Y", 1), channel("Z", 256)]);
+        let rectangle = IntegerBounds::new(Vec2(0, 0), Vec2(16, 256));
+        let samples = vec![0_u8; 16 * 256 * 2 + 16 * 2];
+        for max_size in [0, 10, usize::MAX] {
+            match compress_within(&channels, &samples, rectangle, 256, max_size) {
+                Err(Error::NotSupported(message)) => {
+                    assert!(message.contains("HTJ2K encoder"), "{}", message);
+                }
+                other => panic!("{:?}", other.map(|chunk| chunk.map(|chunk| chunk.len()))),
+            }
+        }
     }
 
     #[test]

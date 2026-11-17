@@ -56,6 +56,21 @@ const MEMORY_PER_CHANNEL: u64 = 4 << 20;
 /// See [`MEMORY_PER_CHANNEL`].
 const MEMORY_PER_CHANNEL_COLUMN: u64 = 4 << 10;
 
+/// The memory of the chunk header and the line layout, kept between chunks.
+/// Each has one element per channel. The codestream decoder of the `htj2k`
+/// crate cannot keep its memory between codestreams, so it is not here.
+#[derive(Debug, Default)]
+pub struct DecodeScratch {
+    /// The file channel of each codestream component.
+    file_channels: Vec<usize>,
+
+    /// Which file channels the chunk header has mapped so far.
+    mapped: Vec<bool>,
+
+    /// Where the samples of each file channel start within a line.
+    line_offsets: Vec<usize>,
+}
+
 /// Decompresses one chunk into `decompressed`, which must be exactly the
 /// size of the chunk's samples, as native-endian samples in the usual
 /// layout: line by line, and within each line the channels in order.
@@ -63,16 +78,24 @@ pub fn decompress_into(
     channels: &ChannelList,
     compressed: &[u8],
     rectangle: IntegerBounds,
+    _pedantic: bool,
+    scratch: &mut DecodeScratch,
     decompressed: &mut [u8],
 ) -> UnitResult {
     let channel_count = channels.list.len();
     let width = rectangle.size.width();
     let height = rectangle.size.height();
 
-    let (file_channels, codestream) = read_chunk_header(compressed, channel_count)?;
+    let DecodeScratch {
+        file_channels,
+        mapped,
+        line_offsets,
+    } = scratch;
+
+    let codestream = read_chunk_header(compressed, channel_count, file_channels, mapped)?;
 
     // where each channel's samples start within a line, and how long a line is
-    let mut line_offsets = Vec::with_capacity(channel_count);
+    line_offsets.clear();
     let mut line_size = 0_usize;
     for channel in &channels.list {
         if channel.sampling != Vec2(1, 1) {
@@ -153,9 +176,15 @@ pub fn decompress_into(
     Ok(())
 }
 
-/// Reads the chunk header. Returns the file channel of each codestream
-/// component and the codestream.
-fn read_chunk_header(compressed: &[u8], channel_count: usize) -> Result<(Vec<usize>, &[u8])> {
+/// Reads the chunk header into `file_channels`, the file channel of each
+/// codestream component, and returns the codestream. `mapped` is memory
+/// for checking that the channels are mapped one to one.
+fn read_chunk_header<'c>(
+    compressed: &'c [u8],
+    channel_count: usize,
+    file_channels: &mut Vec<usize>,
+    mapped: &mut Vec<bool>,
+) -> Result<&'c [u8]> {
     let mut remaining = compressed;
     let mut take = |count: usize| {
         if remaining.len() < count {
@@ -182,15 +211,17 @@ fn read_chunk_header(compressed: &[u8], channel_count: usize) -> Result<(Vec<usi
         return Err(Error::invalid("HTJ2K channel count does not match the header"));
     }
 
-    // a permutation of the channels
-    let mut file_channels = Vec::with_capacity(count);
-    let mut seen = vec![false; count];
+    // a permutation of the channels; the count is that of the header,
+    // so a damaged chunk cannot make these grow
+    file_channels.clear();
+    mapped.clear();
+    mapped.resize(count, false);
     for _ in 0..count {
         let index = usize::from(read_u16(take(2)?));
-        if index >= count || seen[index] {
+        if index >= count || mapped[index] {
             return Err(Error::invalid("HTJ2K channel map"));
         }
-        seen[index] = true;
+        mapped[index] = true;
         file_channels.push(index);
     }
 
@@ -198,7 +229,7 @@ fn read_chunk_header(compressed: &[u8], channel_count: usize) -> Result<(Vec<usi
     if codestream.is_empty() {
         return Err(Error::invalid("HTJ2K codestream missing"));
     }
-    Ok((file_channels, codestream))
+    Ok(codestream)
 }
 
 /// Stores decoded samples as native-endian samples of `sample_type`. The

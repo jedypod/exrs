@@ -51,6 +51,7 @@ pub struct DecodeScratch {
     b44_channels: Vec<b44::ChannelData>,
     piz: piz::DecodeScratch,
     dwa: dwa::DecodeScratch,
+    htj2k: htj2k::DecodeScratch,
 }
 
 impl std::fmt::Debug for DecodeScratch {
@@ -507,9 +508,14 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
-            HTJ2K32 | HTJ2K256 => {
-                htj2k::decompress_into(channels, compressed_le, pixel_section, decompressed_ne)
-            }
+            HTJ2K32 | HTJ2K256 => htj2k::decompress_into(
+                channels,
+                compressed_le,
+                pixel_section,
+                pedantic,
+                &mut scratch.htj2k,
+                decompressed_ne,
+            ),
         };
 
         // map all errors to compression errors

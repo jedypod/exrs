@@ -19,6 +19,7 @@ use std::convert::TryInto;
 
 use crate::{
     error::{usize_to_i32, Error, Result, UnitResult},
+    math::Vec2,
     meta::{
         attribute::{ChannelList, IntegerBounds, SampleType},
         header::Header,
@@ -392,7 +393,7 @@ impl Compression {
         pixel_section: IntegerBounds,
         pedantic: bool,
     ) -> Result<ByteVec> {
-        let expected_byte_size = self.validate_image_section(header, pixel_section);
+        let expected_byte_size = self.validate_image_section(header, pixel_section)?;
 
         // note: always true where self == Uncompressed
         if compressed_le.len() == expected_byte_size {
@@ -426,7 +427,8 @@ impl Compression {
     /// Decompress the image section from bytes of little-endian format
     /// into the start of `decompressed_ne`, in native-endian format,
     /// and return the number of bytes written, which is the pixel count
-    /// of the section times the bytes per pixel of the header.
+    /// of the section times the bytes per pixel of the header, or less
+    /// where channels are subsampled.
     ///
     /// The bytes have the layout that `decompress_image_section_from_le`
     /// returns. It is an error if `decompressed_ne` is too short.
@@ -443,7 +445,7 @@ impl Compression {
         scratch: &mut DecodeScratch,
         decompressed_ne: &mut [u8],
     ) -> Result<usize> {
-        let expected_byte_size = self.validate_image_section(header, pixel_section);
+        let expected_byte_size = self.validate_image_section(header, pixel_section)?;
         let channels = &header.channels;
 
         let decompressed_ne = decompressed_ne
@@ -593,9 +595,13 @@ impl Compression {
         Ok(())
     }
 
-    /// The byte size of the uncompressed section.
-    /// Panics for a section that the header cannot contain.
-    fn validate_image_section(self, header: &Header, pixel_section: IntegerBounds) -> usize {
+    /// The byte size of the uncompressed section, with the sampling of each
+    /// channel. Panics for a section that the header cannot contain.
+    fn validate_image_section(
+        self,
+        header: &Header,
+        pixel_section: IntegerBounds,
+    ) -> Result<usize> {
         let max_tile_size = header.max_block_pixel_size();
 
         assert!(
@@ -606,7 +612,7 @@ impl Compression {
             assert!(self.supports_deep_data());
         }
 
-        pixel_section.size.area() * header.channels.bytes_per_pixel // FIXME this needs to account for subsampling anywhere
+        uncompressed_byte_size(&header.channels, pixel_section)
     }
 
     /// For scan line images and deep scan line images, one or more scan lines
@@ -693,6 +699,27 @@ fn zlib_compress(bytes: &[u8], level: i32) -> Result<ByteVec> {
     let length = written.len();
     compressed.truncate(length);
     Ok(compressed)
+}
+
+/// The size in bytes of the uncompressed samples of a section. A channel
+/// subsampled vertically has a line only where y is a multiple of its
+/// sampling, and a channel subsampled horizontally has fewer samples per
+/// line.
+fn uncompressed_byte_size(channels: &ChannelList, section: IntegerBounds) -> Result<usize> {
+    if channels.list.iter().all(|channel| channel.sampling == Vec2(1, 1)) {
+        return Ok(section.size.area() * channels.bytes_per_pixel);
+    }
+
+    let mut byte_size = 0;
+    for channel in &channels.list {
+        let sampling_y = usize_to_i32(channel.sampling.y().max(1), "sampling")?;
+        let lines = (section.position.y()..section.end().y())
+            .filter(|&y| mod_p(y, sampling_y) == 0)
+            .count();
+        let samples_per_line = section.size.width() / channel.sampling.x().max(1);
+        byte_size += lines * samples_per_line * channel.sample_type.bytes_per_sample();
+    }
+    Ok(byte_size)
 }
 
 // see https://github.com/AcademySoftwareFoundation/openexr/blob/6a9f8af6e89547bcd370ae3cec2b12849eee0b54/OpenEXR/IlmImf/ImfMisc.cpp#L1456-L1541

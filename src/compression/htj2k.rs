@@ -68,8 +68,9 @@ pub struct DecodeScratch {
     /// Which file channels the chunk header has mapped so far.
     mapped: Vec<bool>,
 
-    /// Where the samples of each file channel start within a line.
-    line_offsets: Vec<usize>,
+    /// Where the samples of each file channel are in the chunk. The line
+    /// offsets of each channel keep their memory too.
+    layout: Vec<ChannelLayout>,
 }
 
 /// Decompresses one chunk into `decompressed`, which must be exactly the
@@ -90,27 +91,13 @@ pub fn decompress_into(
     let DecodeScratch {
         file_channels,
         mapped,
-        line_offsets,
+        layout,
     } = scratch;
 
     let codestream = read_chunk_header(compressed, channel_count, file_channels, mapped)?;
 
-    // where each channel's samples start within a line, and how long a line is
-    line_offsets.clear();
-    let mut line_size = 0_usize;
-    for channel in &channels.list {
-        if channel.sampling != Vec2(1, 1) {
-            return Err(Error::unsupported("subsampled channels"));
-        }
-        line_offsets.push(line_size);
-        line_size = channel
-            .sample_type
-            .bytes_per_sample()
-            .checked_mul(width)
-            .and_then(|size| line_size.checked_add(size))
-            .ok_or_else(|| Error::invalid("chunk size"))?;
-    }
-    if line_size.checked_mul(height) != Some(decompressed.len()) {
+    let byte_size = chunk_layout(channels, rectangle, layout)?;
+    if byte_size != decompressed.len() {
         return Err(Error::invalid("decompressed chunk size"));
     }
     if decompressed.is_empty() {
@@ -140,41 +127,124 @@ pub fn decompress_into(
     if siz.get_num_components() as usize != channel_count {
         return Err(Error::invalid("HTJ2K component count does not match the channels"));
     }
-    for component in 0..siz.get_num_components() {
+    // Each component must have the sampling and the size of its channel.
+    // OpenEXR codes a chunk at image offset 0, so a component has
+    // ceil(size / sampling) samples each way, which is the size of the
+    // channel when the chunk starts on a multiple of its sampling.
+    for (component, &file_channel) in (0_u32..).zip(file_channels.iter()) {
         let sampling = siz.get_downsampling(component);
-        if sampling.x != 1
-            || sampling.y != 1
-            || siz.get_recon_width(component) as usize != width
-            || siz.get_recon_height(component) as usize != height
+        let channel_layout = &layout[file_channel];
+        if Vec2(sampling.x as usize, sampling.y as usize) != channels.list[file_channel].sampling
+            || siz.get_recon_width(component) as usize != channel_layout.width
+            || siz.get_recon_height(component) as usize != channel_layout.lines.len()
         {
             return Err(Error::invalid("HTJ2K component size does not match the chunk"));
         }
     }
 
-    // one line of each component in turn, which is one line of the chunk
-    decoder.set_planar(false);
+    // OpenEXR codes subsampled channels one after the other, and otherwise
+    // one line of each component in turn, which is one line of the chunk.
+    let planar = is_planar(channels);
+    decoder.set_planar(planar);
     decoder.create().map_err(codestream_error)?;
 
-    for line in decompressed.chunks_exact_mut(line_size) {
-        for (component, &file_channel) in file_channels.iter().enumerate() {
-            let (pulled, samples) = decoder
-                .pull()
-                .map_err(codestream_error)?
-                .ok_or_else(|| Error::invalid("HTJ2K codestream ended early"))?;
-            if pulled as usize != component || !samples.is_i32() {
-                return Err(Error::invalid("HTJ2K line order"));
-            }
-            let samples =
-                samples.i32().get(..width).ok_or_else(|| Error::invalid("HTJ2K line size"))?;
+    let mut pull_line = |component: usize, line: usize| -> UnitResult {
+        let (pulled, samples) = decoder
+            .pull()
+            .map_err(codestream_error)?
+            .ok_or_else(|| Error::invalid("HTJ2K codestream ended early"))?;
+        if pulled as usize != component || !samples.is_i32() {
+            return Err(Error::invalid("HTJ2K line order"));
+        }
 
-            let channel = &channels.list[file_channel];
-            let start = line_offsets[file_channel];
-            let size = channel.sample_type.bytes_per_sample() * width;
-            write_samples(&mut line[start..start + size], samples, channel.sample_type);
+        let file_channel = file_channels[component];
+        let channel_layout = &layout[file_channel];
+        let samples = samples
+            .i32()
+            .get(..channel_layout.width)
+            .ok_or_else(|| Error::invalid("HTJ2K line size"))?;
+
+        let sample_type = channels.list[file_channel].sample_type;
+        let start = channel_layout.lines[line];
+        let size = sample_type.bytes_per_sample() * channel_layout.width;
+        write_samples(&mut decompressed[start..start + size], samples, sample_type);
+        Ok(())
+    };
+
+    if planar {
+        for (component, &file_channel) in file_channels.iter().enumerate() {
+            for line in 0..layout[file_channel].lines.len() {
+                pull_line(component, line)?;
+            }
+        }
+    } else {
+        for line in 0..height {
+            for component in 0..channel_count {
+                pull_line(component, line)?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Where the samples of one channel are in an uncompressed chunk.
+#[derive(Debug, Default)]
+struct ChannelLayout {
+    /// Samples per line.
+    width: usize,
+
+    /// The byte offset of each line of the channel, top to bottom.
+    lines: Vec<usize>,
+}
+
+/// Computes into `layout` where the samples of each channel are in an
+/// uncompressed chunk, and returns the size of the chunk in bytes. The chunk
+/// holds its lines top to bottom, and each line the channels in order; a
+/// channel subsampled vertically has a line only where y is a multiple of
+/// its sampling. The memory of `layout` is reused.
+fn chunk_layout(
+    channels: &ChannelList,
+    rectangle: IntegerBounds,
+    layout: &mut Vec<ChannelLayout>,
+) -> Result<usize> {
+    layout.resize_with(channels.list.len(), ChannelLayout::default);
+    for (channel, channel_layout) in channels.list.iter().zip(layout.iter_mut()) {
+        let sampling = channel.sampling;
+        if sampling.x() == 0
+            || sampling.y() == 0
+            || rectangle.size.width() % sampling.x() != 0
+            || mod_p(rectangle.position.x(), usize_to_i32(sampling.x(), "sampling")?) != 0
+        {
+            return Err(Error::invalid("channel sampling does not divide the chunk"));
+        }
+        channel_layout.width = rectangle.size.width() / sampling.x();
+        channel_layout.lines.clear();
+    }
+
+    let mut byte_size = 0_usize;
+    for y in rectangle.position.y()..rectangle.end().y() {
+        for (channel, channel_layout) in channels.list.iter().zip(layout.iter_mut()) {
+            if mod_p(y, usize_to_i32(channel.sampling.y(), "sampling")?) != 0 {
+                continue;
+            }
+            channel_layout.lines.push(byte_size);
+            byte_size = channel
+                .sample_type
+                .bytes_per_sample()
+                .checked_mul(channel_layout.width)
+                .and_then(|size| byte_size.checked_add(size))
+                .ok_or_else(|| Error::invalid("chunk size"))?;
+        }
+    }
+
+    Ok(byte_size)
+}
+
+/// Whether `OpenEXR` codes the components one after the other, which it does
+/// when any channel is subsampled.
+fn is_planar(channels: &ChannelList) -> bool {
+    channels.list.iter().any(|channel| channel.sampling != Vec2(1, 1))
 }
 
 /// Reads the chunk header into `file_channels`, the file channel of each

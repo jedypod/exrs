@@ -181,7 +181,8 @@ impl UncompressedBlock {
     ///
     /// The bytes written are those that `decompress_chunk` returns as the
     /// `data` of the block, in native-endian format: the pixel count of the
-    /// block times the bytes per pixel of the layer. A destination of
+    /// block times the bytes per pixel of the layer, or less where channels
+    /// are subsampled. A destination of
     /// `Header::max_block_byte_size` bytes fits any block of that layer.
     /// It is an error if the destination is too short.
     ///

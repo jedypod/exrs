@@ -772,9 +772,57 @@ fn htj2k_allocations_per_chunk() {
             .count();
         assert_ne!(compressed_chunk_count, 0);
 
+        // The decoder reuses its memory for a chunk of the shape of the one
+        // before, and allocates it again for a chunk of another shape, such
+        // as the last chunk of a file after the full ones. These files have
+        // few chunks, so the two are counted apart: a large file has
+        // mostly chunks of one shape.
+        let mut previous_size = None;
+        let mut reused = (0, 0, 0);
+        let mut rebuilt = (0, 0, 0);
+        // the first pass only sets the shape of the chunk before the first
+        for (pass, chunk) in
+            chunks.iter().map(|chunk| (0, chunk)).chain(chunks.iter().map(|chunk| (1, chunk)))
+        {
+            let index = UncompressedBlock::decompress_chunk(chunk.clone(), &meta_data, false)
+                .unwrap()
+                .index;
+            let mut decompress = || {
+                UncompressedBlock::decompress_chunk_into(
+                    chunk_ref(chunk),
+                    &meta_data,
+                    false,
+                    &mut scratch,
+                    &mut destination,
+                )
+                .unwrap();
+            };
+            let mut count = 0;
+            let bytes = count_allocated_bytes(|| count = count_allocations(&mut decompress));
+            if chunk_ref(chunk).compressed_pixels_le.len() == block_size(chunk) {
+                continue;
+            }
+            let tally = if previous_size == Some(index.pixel_size) {
+                &mut reused
+            } else {
+                &mut rebuilt
+            };
+            if pass == 1 {
+                *tally = (tally.0 + 1, tally.1 + count, tally.2 + bytes);
+            }
+            previous_size = Some(index.pixel_size);
+        }
+        let average = |(chunks, count, bytes): (usize, usize, usize)| {
+            count.checked_div(chunks).map_or_else(
+                || "none".to_string(),
+                |count| format!("{} allocations and {} KiB", count, bytes / chunks / 1024),
+            )
+        };
+
         println!(
             "{}: {} channels, {} of {} chunks compressed, {:?} pixels per block: \
-             {} allocations and {} KiB per compressed chunk",
+             {} allocations and {} KiB per compressed chunk; \
+             after a chunk of the same shape {}, of another shape {}",
             path.strip_prefix("tests/images/valid/custom").unwrap().display(),
             header.channels.list.len(),
             compressed_chunk_count,
@@ -782,6 +830,8 @@ fn htj2k_allocations_per_chunk() {
             header.max_block_pixel_size(),
             allocation_count / compressed_chunk_count,
             allocated_bytes / compressed_chunk_count / 1024,
+            average(reused),
+            average(rebuilt),
         );
     }
 }

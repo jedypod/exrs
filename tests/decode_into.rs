@@ -2,7 +2,7 @@
 //! the bytes that `UncompressedBlock::decompress_chunk` returns, must not
 //! allocate once its scratch is warm, and must refuse a destination that is
 //! too small and sizes that a damaged chunk claims. HTJ2K, which still
-//! allocates for every chunk, is measured instead of asserted.
+//! makes a few allocations for every chunk, is measured instead of asserted.
 //!
 //! A separate test binary, because it installs a global allocator that counts
 //! the allocations of each thread, and refuses any single allocation over
@@ -713,12 +713,13 @@ fn subsampled_htj2k_decompresses_into_a_slice_like_to_a_vector() {
     assert_ne!(raw_count, 0);
 }
 
-/// HTJ2K cannot decompress without allocating yet: the codestream decoder
-/// of the `htj2k` crate allocates its memory for every codestream. This
-/// prints how much, measured like
-/// `decompressing_into_a_slice_does_not_allocate` does: a second pass over all
-/// chunks, with a warm scratch. Run it with `cargo test --test decode_into --
-/// --ignored --nocapture`.
+/// HTJ2K cannot decompress without allocating: the codestream decoder of
+/// the `htj2k` crate keeps its memory in the scratch, but its headers still
+/// allocate a little for every codestream, and its buffers are allocated
+/// again for a codestream of a new shape. This prints how much, measured
+/// like `decompressing_into_a_slice_does_not_allocate` does: a second pass
+/// over all chunks, with a warm scratch. Run it with
+/// `cargo test --test decode_into -- --ignored --nocapture`.
 #[cfg(feature = "htj2k")]
 #[test]
 #[ignore = "a measurement, not a requirement"]

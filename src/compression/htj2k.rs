@@ -33,7 +33,11 @@
 
 use std::convert::TryFrom;
 
-use ::htj2k::{codestream::Encoder, params::nonlinearity, types::Point};
+use ::htj2k::{
+    codestream::{Codestream, DecoderMemory, Encoder},
+    params::nonlinearity,
+    types::Point,
+};
 
 use super::*;
 use crate::{math::Vec2, meta::attribute::ChannelDescription};
@@ -366,11 +370,17 @@ fn encoder_error(error: ::htj2k::Error) -> Error {
     Error::unsupported(format!("HTJ2K encoder: {}", error.message()))
 }
 
-/// The memory of the chunk header and the line layout, kept between chunks.
-/// Each has one element per channel. The codestream decoder of the `htj2k`
-/// crate cannot keep its memory between codestreams, so it is not here.
+/// The memory of the codestream decoder, the chunk header and the line
+/// layout, kept between chunks. The chunk header and the layout have one
+/// element per channel.
 #[derive(Debug, Default)]
 pub struct DecodeScratch {
+    /// The buffers of the codestream decoder. A chunk of the shape and
+    /// coding of the last one decoded reuses them instead of allocating
+    /// its own; the decoder applies its memory limit to them as to new
+    /// buffers.
+    decoder: DecoderMemory,
+
     /// The file channel of each codestream component.
     file_channels: Vec<usize>,
 
@@ -393,17 +403,14 @@ pub fn decompress_into(
     scratch: &mut DecodeScratch,
     decompressed: &mut [u8],
 ) -> UnitResult {
-    let channel_count = channels.list.len();
-    let width = rectangle.size.width();
-    let height = rectangle.size.height();
-
     let DecodeScratch {
+        decoder: decoder_memory,
         file_channels,
         mapped,
         layout,
     } = scratch;
 
-    let codestream = read_chunk_header(compressed, channel_count, file_channels, mapped)?;
+    let codestream = read_chunk_header(compressed, channels.list.len(), file_channels, mapped)?;
 
     let byte_size = chunk_layout(channels, rectangle, layout)?;
     if byte_size != decompressed.len() {
@@ -413,7 +420,39 @@ pub fn decompress_into(
         return Ok(());
     }
 
-    let mut decoder = ::htj2k::codestream::Codestream::new();
+    // The decoder borrows the chunk, so it cannot live in the scratch. Its
+    // memory goes back there whether the codestream decodes or not: the
+    // decoder accepts memory from any earlier codestream, failed or not.
+    let mut decoder = Codestream::with_memory(std::mem::take(decoder_memory));
+    let result = decode_codestream(
+        &mut decoder,
+        codestream,
+        channels,
+        rectangle,
+        file_channels,
+        layout,
+        decompressed,
+    );
+    *decoder_memory = decoder.into_memory();
+    result
+}
+
+/// Decodes the codestream of a chunk with `decoder`, which is in the state
+/// of a new decoder, into `decompressed`. `file_channels` is the chunk
+/// header and `layout` the layout of the chunk.
+fn decode_codestream<'c>(
+    decoder: &mut Codestream<'c>,
+    codestream: &'c [u8],
+    channels: &ChannelList,
+    rectangle: IntegerBounds,
+    file_channels: &[usize],
+    layout: &[ChannelLayout],
+    decompressed: &mut [u8],
+) -> UnitResult {
+    let channel_count = channels.list.len();
+    let width = rectangle.size.width();
+    let height = rectangle.size.height();
+
     let memory_limit = (width as u64)
         .saturating_mul(MEMORY_PER_CHANNEL_COLUMN)
         .saturating_add(MEMORY_PER_CHANNEL)

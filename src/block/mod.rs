@@ -188,7 +188,9 @@ impl UncompressedBlock {
     ///
     /// No memory is allocated once `scratch` has grown to fit the largest
     /// block, as all temporary memory is taken from it. The exception is
-    /// HTJ2K, whose codestream decoder allocates for every block.
+    /// HTJ2K, whose codestream decoder makes a few allocations for every
+    /// block, and more when the block differs in shape or coding from the
+    /// one before.
     pub fn decompress_chunk_into(
         chunk: ChunkRef<'_>,
         meta_data: &MetaData,

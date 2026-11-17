@@ -487,6 +487,78 @@ fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
     }
 }
 
+/// HTJ2K cannot decompress without allocating yet: the codestream decoder
+/// of the `htj2k` crate allocates its memory for every codestream. This
+/// prints how much, measured like
+/// `decompressing_into_a_slice_does_not_allocate` does: a second pass over all
+/// chunks, with a warm scratch. Run it with `cargo test --test decode_into --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a requirement"]
+fn htj2k_allocations_per_chunk() {
+    // also the wider files of `tests/across_compression.rs`, as the memory
+    // of the decoder grows with the width of the chunk
+    let directory = Path::new("tests/images/valid/custom/compression_methods");
+    let wide_files = ["f16", "f32"].iter().flat_map(move |sample_type| {
+        ["htj2k32", "htj2k256"]
+            .iter()
+            .map(move |method| directory.join(sample_type).join(format!("{method}.exr")))
+    });
+
+    for path in htj2k_files().map(|(path, _)| path).chain(wide_files) {
+        let bytes = std::fs::read(&path).unwrap();
+        let (meta_data, chunks) = read_chunks(&bytes);
+        let header = &meta_data.headers[0];
+
+        let mut scratch = DecodeScratch::default();
+        let mut destination = vec![0_u8; header.max_block_byte_size()];
+        let mut decompress_all_chunks = || {
+            for chunk in &chunks {
+                UncompressedBlock::decompress_chunk_into(
+                    chunk_ref(chunk),
+                    &meta_data,
+                    false,
+                    &mut scratch,
+                    &mut destination,
+                )
+                .unwrap();
+            }
+        };
+
+        // the first time, the scratch grows to fit the largest block
+        decompress_all_chunks();
+
+        let mut allocation_count = 0;
+        let allocated_bytes =
+            count_allocated_bytes(|| allocation_count = count_allocations(decompress_all_chunks));
+
+        // a chunk that is stored raw does not reach the decoder
+        let block_size = |chunk: &Chunk| {
+            let index = UncompressedBlock::decompress_chunk(chunk.clone(), &meta_data, false)
+                .unwrap()
+                .index;
+            index.pixel_size.area() * header.channels.bytes_per_pixel
+        };
+        let compressed_chunk_count = chunks
+            .iter()
+            .filter(|chunk| chunk_ref(chunk).compressed_pixels_le.len() != block_size(chunk))
+            .count();
+        assert_ne!(compressed_chunk_count, 0);
+
+        println!(
+            "{}: {} channels, {} of {} chunks compressed, {:?} pixels per block: \
+             {} allocations and {} KiB per compressed chunk",
+            path.strip_prefix("tests/images/valid/custom").unwrap().display(),
+            header.channels.list.len(),
+            compressed_chunk_count,
+            chunks.len(),
+            header.max_block_pixel_size(),
+            allocation_count / compressed_chunk_count,
+            allocated_bytes / compressed_chunk_count / 1024,
+        );
+    }
+}
+
 /// The header of a DWA chunk states the size of each of its sections. Without
 /// a limit, the decoder would make room for whatever a damaged header claims,
 /// and keep that room in the scratch.

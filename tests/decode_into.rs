@@ -10,14 +10,16 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
+    collections::HashMap,
     convert::TryInto,
     io::Cursor,
+    path::{Path, PathBuf},
 };
 
 use exr::{
     block::{
         chunk::{BlockLocation, Chunk, ChunkRef, CompressedBlock},
-        UncompressedBlock,
+        BlockIndex, UncompressedBlock,
     },
     compression::DecodeScratch,
     meta::MetaData,
@@ -377,6 +379,111 @@ fn a_chunk_size_beyond_the_bytes_is_an_error() {
         for available in [0, 3, size_position + 3, chunk_bytes.len() - 1] {
             assert!(read_with_size(pixel_size as i32, available).is_err(), "{} bytes", available);
         }
+    }
+}
+
+/// The files that OpenEXR wrote with HTJ2K, as exrs cannot write it, each
+/// with the uncompressed file it was converted from. See `tests/htj2k.rs`.
+fn htj2k_files() -> impl Iterator<Item = (PathBuf, PathBuf)> {
+    let directory = Path::new("tests/images/valid/custom/htj2k");
+    ["rgba_half", "rgb_float_uint", "mixed_rgb", "y_half", "tiled"].iter().flat_map(move |case| {
+        ["htj2k32", "htj2k256"].iter().map(move |method| {
+            (directory.join(format!("{case}_{method}.exr")), directory.join(format!("{case}.exr")))
+        })
+    })
+}
+
+/// The bytes of each sample of a decompressed block, by layer, level,
+/// channel and position, so that files with different blocks can be compared.
+type SamplesByPosition = HashMap<(usize, Vec2<usize>, usize, Vec2<usize>), Vec<u8>>;
+
+fn insert_samples(
+    samples: &mut SamplesByPosition,
+    meta_data: &MetaData,
+    index: BlockIndex,
+    block: &[u8],
+) {
+    let channels = &meta_data.headers[index.layer].channels.list;
+    let mut remaining = block;
+
+    for y in 0..index.pixel_size.height() {
+        for (channel_index, channel) in channels.iter().enumerate() {
+            let size = channel.sample_type.bytes_per_sample();
+            for x in 0..index.pixel_size.width() {
+                let (sample, rest) = remaining.split_at(size);
+                let position = index.pixel_position + Vec2(x, y);
+                let key = (index.layer, index.level, channel_index, position);
+                assert!(samples.insert(key, sample.to_vec()).is_none(), "{:?} twice", key);
+                remaining = rest;
+            }
+        }
+    }
+
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
+    // one scratch for all files, as for the other methods
+    let mut scratch = DecodeScratch::default();
+    let mut destination = Vec::new();
+
+    for (path, reference_path) in htj2k_files() {
+        let (meta_data, chunks) = read_chunks(&std::fs::read(&path).unwrap());
+        let header = &meta_data.headers[0];
+        assert!(
+            matches!(header.compression, Compression::HTJ2K32 | Compression::HTJ2K256),
+            "{}",
+            path.display()
+        );
+
+        destination.resize(header.max_block_byte_size(), 0);
+        let mut decompressed = SamplesByPosition::new();
+
+        // also decompress the chunks in reverse order,
+        // so that each chunk follows a different chunk than before
+        for (pass, chunk) in chunks.iter().chain(chunks.iter().rev()).enumerate() {
+            let expected = UncompressedBlock::decompress_chunk(chunk.clone(), &meta_data, true)
+                .unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
+
+            // make sure that every byte is written
+            destination.fill(0xa5);
+
+            let index = UncompressedBlock::decompress_chunk_into(
+                chunk_ref(chunk),
+                &meta_data,
+                true,
+                &mut scratch,
+                &mut destination,
+            )
+            .unwrap_or_else(|error| panic!("{}: {}", path.display(), error));
+
+            let size = expected.data.len();
+            assert_eq!(index, expected.index, "{}", path.display());
+            assert!(destination[..size] == expected.data[..], "{}: {:?}", path.display(), index);
+            assert!(
+                destination[size..].iter().all(|&byte| byte == 0xa5),
+                "{}: wrote past the block",
+                path.display()
+            );
+
+            if pass < chunks.len() {
+                insert_samples(&mut decompressed, &meta_data, index, &destination[..size]);
+            }
+        }
+
+        // every sample as OpenEXR wrote it before compressing it
+        let (reference_meta_data, reference_chunks) =
+            read_chunks(&std::fs::read(&reference_path).unwrap());
+        let mut reference = SamplesByPosition::new();
+        for chunk in reference_chunks {
+            let block =
+                UncompressedBlock::decompress_chunk(chunk, &reference_meta_data, true).unwrap();
+            insert_samples(&mut reference, &reference_meta_data, block.index, &block.data);
+        }
+
+        assert_eq!(decompressed.len(), reference.len(), "{}", path.display());
+        assert!(decompressed == reference, "{}: different samples", path.display());
     }
 }
 

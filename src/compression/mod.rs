@@ -3,6 +3,7 @@
 
 // private modules make non-breaking changes easier
 mod b44;
+mod htj2k;
 
 // public only for benchmarking
 #[doc(hidden)]
@@ -502,10 +503,8 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "yet unimplemented compression method: {self}"
-                )));
+            HTJ2K32 | HTJ2K256 => {
+                htj2k::decompress_into(channels, compressed_le, pixel_section, decompressed_ne)
             }
         };
 
@@ -556,8 +555,13 @@ impl Compression {
             // of up to four bytes, with any number of AC values being zero
             DWAA(_) | DWAB(_) => ZIP * 128,
 
-            // not stored raw, or not implemented, which is reported later
-            Uncompressed | HTJ2K32 | HTJ2K256 => return Ok(()),
+            // uncompressed data is always stored raw
+            Uncompressed => return Ok(()),
+
+            // code blocks without passes decode to zeros, so a short
+            // codestream can describe a chunk of any size; the decoder
+            // limits its own memory instead
+            HTJ2K32 | HTJ2K256 => return Ok(()),
         };
 
         if expected_byte_size > compressed_byte_size.saturating_mul(max_expansion) {

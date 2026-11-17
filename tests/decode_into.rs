@@ -11,16 +11,19 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
-    collections::HashMap,
     convert::TryInto,
     io::Cursor,
+};
+#[cfg(feature = "htj2k")]
+use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
 use exr::{
     block::{
         chunk::{BlockLocation, Chunk, ChunkRef, CompressedBlock},
-        BlockIndex, UncompressedBlock,
+        UncompressedBlock,
     },
     compression::DecodeScratch,
     meta::MetaData,
@@ -385,6 +388,7 @@ fn a_chunk_size_beyond_the_bytes_is_an_error() {
 
 /// The files that OpenEXR wrote with HTJ2K, as exrs cannot write it, each
 /// with the uncompressed file it was converted from. See `tests/htj2k.rs`.
+#[cfg(feature = "htj2k")]
 fn htj2k_files() -> impl Iterator<Item = (PathBuf, PathBuf)> {
     let directory = Path::new("tests/images/valid/custom/htj2k");
     ["rgba_half", "rgb_float_uint", "mixed_rgb", "y_half", "tiled"].iter().flat_map(move |case| {
@@ -396,12 +400,14 @@ fn htj2k_files() -> impl Iterator<Item = (PathBuf, PathBuf)> {
 
 /// The bytes of each sample of a decompressed block, by layer, level,
 /// channel and position, so that files with different blocks can be compared.
+#[cfg(feature = "htj2k")]
 type SamplesByPosition = HashMap<(usize, Vec2<usize>, usize, Vec2<usize>), Vec<u8>>;
 
+#[cfg(feature = "htj2k")]
 fn insert_samples(
     samples: &mut SamplesByPosition,
     meta_data: &MetaData,
-    index: BlockIndex,
+    index: exr::block::BlockIndex,
     block: &[u8],
 ) {
     let channels = &meta_data.headers[index.layer].channels.list;
@@ -423,6 +429,7 @@ fn insert_samples(
     assert!(remaining.is_empty());
 }
 
+#[cfg(feature = "htj2k")]
 #[test]
 fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
     // one scratch for all files, as for the other methods
@@ -494,6 +501,7 @@ fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
 /// `decompressing_into_a_slice_does_not_allocate` does: a second pass over all
 /// chunks, with a warm scratch. Run it with `cargo test --test decode_into --
 /// --ignored --nocapture`.
+#[cfg(feature = "htj2k")]
 #[test]
 #[ignore = "a measurement, not a requirement"]
 fn htj2k_allocations_per_chunk() {

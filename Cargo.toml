@@ -33,7 +33,7 @@ bit_field = "^0.10.1"          # exr file version bit flags
 zlib-rs = { version = "^0.6.0", default-features = false, features = ["std"] }  # zip compression and decompression, into memory of the caller
 smallvec = "^1.7.0"            # make cache-friendly allocations        TODO profile if smallvec is really an improvement!
 rayon-core = { version = "^1.11.0", optional = true }         # threading for parallel compression
-htj2k = { path = "../htj2k" }  # HTJ2K codestream decoding, ported from OpenJPH
+htj2k = { path = "../htj2k", optional = true }  # HTJ2K codestream decoding, ported from OpenJPH
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 multiversion = "0.9.2" # runtime AVX2 selection for better performance on x86
@@ -53,6 +53,10 @@ default = ["rayon"]
 
 # rayon is used for parallel compression
 rayon = ["dep:rayon-core"]
+
+# Read HTJ2K32 and HTJ2K256 compressed files, using the pure Rust htj2k crate.
+# Without it, reading their pixels returns `Error::NotSupported`.
+htj2k = ["dep:htj2k"]
 
 # Expose deterministic input blocks for the DWA DCT benchmark.
 # `cargo bench --features dct-benches --bench dct`

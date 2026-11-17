@@ -3,6 +3,7 @@
 
 // private modules make non-breaking changes easier
 mod b44;
+#[cfg(feature = "htj2k")]
 mod htj2k;
 
 // public only for benchmarking
@@ -53,6 +54,7 @@ pub struct DecodeScratch {
     b44_channels: Vec<b44::ChannelData>,
     piz: piz::DecodeScratch,
     dwa: dwa::DecodeScratch,
+    #[cfg(feature = "htj2k")]
     htj2k: htj2k::DecodeScratch,
 }
 
@@ -511,6 +513,7 @@ impl Compression {
                 scratch,
                 decompressed_ne,
             ),
+            #[cfg(feature = "htj2k")]
             HTJ2K32 | HTJ2K256 => htj2k::decompress_into(
                 channels,
                 compressed_le,
@@ -519,6 +522,12 @@ impl Compression {
                 &mut scratch.htj2k,
                 decompressed_ne,
             ),
+            #[cfg(not(feature = "htj2k"))]
+            HTJ2K32 | HTJ2K256 => {
+                return Err(Error::unsupported(
+                    "HTJ2K decompression (enable the `htj2k` feature of the exr crate)",
+                ))
+            }
         };
 
         // map all errors to compression errors

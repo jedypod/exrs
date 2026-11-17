@@ -386,8 +386,8 @@ fn a_chunk_size_beyond_the_bytes_is_an_error() {
     }
 }
 
-/// The files that OpenEXR wrote with HTJ2K, as exrs cannot write it, each
-/// with the uncompressed file it was converted from. See `tests/htj2k.rs`.
+/// The files that OpenEXR wrote with HTJ2K, each with the uncompressed file
+/// it was converted from. See `tests/htj2k.rs`.
 #[cfg(feature = "htj2k")]
 fn htj2k_files() -> impl Iterator<Item = (PathBuf, PathBuf)> {
     let directory = Path::new("tests/images/valid/custom/htj2k");
@@ -493,6 +493,224 @@ fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
         assert_eq!(decompressed.len(), reference.len(), "{}", path.display());
         assert!(decompressed == reference, "{}: different samples", path.display());
     }
+}
+
+/// A layer with subsampled channels, which exrs cannot write through the
+/// image API, as a header and the native-endian samples of each block in
+/// the layout OpenEXR packs them: line by line, and on each line only the
+/// channels that have a line there, each with one sample in its x sampling.
+#[cfg(feature = "htj2k")]
+struct Subsampled {
+    header: exr::meta::header::Header,
+    blocks: Vec<(exr::meta::TileIndices, IntegerBounds, Vec<u8>)>,
+}
+
+#[cfg(feature = "htj2k")]
+impl Subsampled {
+    /// `channels` are (name, type, x sampling, y sampling), sorted by name.
+    fn new(
+        channels: &[(&str, SampleType, usize, usize)],
+        compression: Compression,
+        blocks: exr::meta::BlockDescription,
+    ) -> Self {
+        let size = Vec2(70, 320);
+        let descriptions = channels
+            .iter()
+            .map(|&(name, sample_type, x, y)| ChannelDescription {
+                name: name.into(),
+                sample_type,
+                quantize_linearly: false,
+                sampling: Vec2(x, y),
+            })
+            .collect();
+
+        // the data window starts on a multiple of every sampling
+        let header = exr::meta::header::Header::new("subsampled".into(), size, descriptions)
+            .with_encoding(compression, blocks, LineOrder::Increasing)
+            .with_position(Vec2(-4, -64));
+
+        let blocks = header
+            .blocks_increasing_y_order()
+            .map(|tile| {
+                let rectangle = header.get_absolute_block_pixel_coordinates(tile.location).unwrap();
+                let mut samples = Vec::new();
+                for y in rectangle.position.y()..rectangle.end().y() {
+                    for (index, &(_, sample_type, x_sampling, y_sampling)) in
+                        channels.iter().enumerate()
+                    {
+                        if y.rem_euclid(y_sampling as i32) != 0 {
+                            continue;
+                        }
+                        for x in rectangle.position.x()..rectangle.end().x() {
+                            if x.rem_euclid(x_sampling as i32) != 0 {
+                                continue;
+                            }
+                            let value = 0.01 * (x + 2 * y) as f32 + 0.1 * index as f32;
+                            match sample_type {
+                                SampleType::F16 => {
+                                    samples.extend_from_slice(&f16::from_f32(value).to_ne_bytes())
+                                }
+                                SampleType::F32 => samples.extend_from_slice(&value.to_ne_bytes()),
+                                SampleType::U32 => samples
+                                    .extend_from_slice(&((x + y).unsigned_abs() / 3).to_ne_bytes()),
+                            }
+                        }
+                    }
+                }
+                (tile, rectangle, samples)
+            })
+            .collect();
+
+        Self {
+            header,
+            blocks,
+        }
+    }
+
+    /// The meta data and the chunks that exrs compresses the blocks to.
+    fn compress(&self) -> (MetaData, Vec<Chunk>) {
+        use exr::block::chunk::{CompressedScanLineBlock, CompressedTileBlock};
+
+        let header = &self.header;
+        let chunks = self
+            .blocks
+            .iter()
+            .map(|(tile, rectangle, samples)| {
+                let compressed_pixels_le = header
+                    .compression
+                    .compress_image_section_to_le(header, samples.clone(), *rectangle)
+                    .unwrap();
+                let compressed_block = match header.blocks {
+                    exr::meta::BlockDescription::ScanLines => {
+                        CompressedBlock::ScanLine(CompressedScanLineBlock {
+                            y_coordinate: rectangle.position.y()
+                                + header.own_attributes.layer_position.y(),
+                            compressed_pixels_le,
+                        })
+                    }
+                    exr::meta::BlockDescription::Tiles(_) => {
+                        CompressedBlock::Tile(CompressedTileBlock {
+                            coordinates: tile.location,
+                            compressed_pixels_le,
+                        })
+                    }
+                };
+                Chunk {
+                    layer_index: 0,
+                    compressed_block,
+                }
+            })
+            .collect();
+
+        // exrs refuses to validate a header with subsampled channels
+        let requirements = exr::meta::Requirements {
+            file_format_version: 2,
+            is_single_layer_and_tiled: matches!(
+                header.blocks,
+                exr::meta::BlockDescription::Tiles(_)
+            ),
+            has_long_names: false,
+            has_deep_data: false,
+            has_multiple_layers: false,
+        };
+        let meta_data = MetaData {
+            requirements,
+            headers: smallvec![header.clone()],
+        };
+        (meta_data, chunks)
+    }
+}
+
+/// The HTJ2K decoder lays out subsampled channels by their sampling, and
+/// decodes their codestreams planar, as OpenEXR codes them. Decompressing
+/// into a slice must give the same bytes as decompressing to a vector, and
+/// both the samples that were compressed, also for the chunks of a channel
+/// sampled more sparsely than a block, which are stored raw.
+#[cfg(feature = "htj2k")]
+#[test]
+fn subsampled_htj2k_decompresses_into_a_slice_like_to_a_vector() {
+    use exr::meta::{
+        attribute::{LevelMode, TileDescription},
+        BlockDescription,
+    };
+    use SampleType::{F16, F32, U32};
+
+    let luma_chroma = [
+        ("A", F32, 1, 1),
+        ("BY", F16, 2, 2),
+        ("RY", F16, 2, 2),
+        ("Y", F16, 1, 1),
+        ("id", U32, 2, 1),
+    ];
+    let sparse = [("Y", F16, 1, 1), ("z", F32, 1, 64)];
+    let tiles = BlockDescription::Tiles(TileDescription {
+        tile_size: Vec2(24, 40),
+        level_mode: LevelMode::Singular,
+        rounding_mode: exr::math::RoundingMode::Down,
+    });
+
+    let mut layers = Vec::new();
+    for compression in [Compression::HTJ2K32, Compression::HTJ2K256] {
+        layers.push(Subsampled::new(&luma_chroma, compression, BlockDescription::ScanLines));
+        layers.push(Subsampled::new(&luma_chroma, compression, tiles));
+        layers.push(Subsampled::new(&sparse, compression, BlockDescription::ScanLines));
+    }
+
+    // one scratch for all layers, as for the other tests
+    let mut scratch = DecodeScratch::default();
+    let mut destination = Vec::new();
+    let (mut coded_count, mut raw_count) = (0, 0);
+
+    for layer in &layers {
+        let (meta_data, chunks) = layer.compress();
+        let header = &meta_data.headers[0];
+        let name =
+            format!("{} {:?} {}", header.compression, header.blocks, header.channels.list.len());
+        destination.resize(header.max_block_byte_size(), 0);
+
+        // also decompress the chunks in reverse order,
+        // so that each chunk follows a different chunk than before
+        let blocks = layer.blocks.iter().chain(layer.blocks.iter().rev());
+        for (chunk, (_, _, samples)) in chunks.iter().chain(chunks.iter().rev()).zip(blocks) {
+            let expected = UncompressedBlock::decompress_chunk(chunk.clone(), &meta_data, true)
+                .unwrap_or_else(|error| panic!("{}: {}", name, error));
+
+            // make sure that every byte is written
+            destination.fill(0xa5);
+
+            let index = UncompressedBlock::decompress_chunk_into(
+                chunk_ref(chunk),
+                &meta_data,
+                true,
+                &mut scratch,
+                &mut destination,
+            )
+            .unwrap_or_else(|error| panic!("{}: {}", name, error));
+
+            let size = expected.data.len();
+            assert_eq!(index, expected.index, "{}", name);
+            assert_eq!(size, samples.len(), "{}: {:?}", name, index);
+            assert!(expected.data == *samples, "{}: different samples at {:?}", name, index);
+            assert!(destination[..size] == expected.data[..], "{}: {:?}", name, index);
+            assert!(
+                destination[size..].iter().all(|&byte| byte == 0xa5),
+                "{}: wrote past the block",
+                name
+            );
+
+            let compressed = chunk_ref(chunk).compressed_pixels_le;
+            if compressed.len() == size {
+                raw_count += 1;
+            } else {
+                assert!(compressed.starts_with(b"HT"), "{}: {:?}", name, index);
+                coded_count += 1;
+            }
+        }
+    }
+
+    // `sparse` under HTJ2K32 is all raw, the other layers are coded
+    assert_ne!(coded_count, 0);
+    assert_ne!(raw_count, 0);
 }
 
 /// HTJ2K cannot decompress without allocating yet: the codestream decoder

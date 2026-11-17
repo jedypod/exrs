@@ -31,7 +31,7 @@
 //! make the codestream planar: each component is coded with its channel's
 //! sampling, one after the other.
 
-use std::convert::TryFrom;
+use std::{cell::Cell, convert::TryFrom};
 
 use ::htj2k::{
     codestream::{Codestream, DecoderMemory, Encoder},
@@ -176,23 +176,48 @@ fn compress_within(
     // stops, so refused parameters stay errors.
     let codestream_limit = max_size.saturating_sub(compressed.len());
     let codestream_limit = u64::try_from(codestream_limit).unwrap_or(u64::MAX);
-    let mut encoder = new_encoder(channels, &file_channels, rgb, planar, image_size)
-        .and_then(|mut encoder| encoder.set_output_limit(codestream_limit).map(|()| encoder))
-        .map_err(encoder_error)?;
 
-    let outcome = encode_samples(
-        &mut encoder,
-        &mut compressed,
-        channels,
-        uncompressed,
-        &layout,
-        &file_channels,
-    )?;
-    match outcome {
-        Ok(()) => Ok(Some(compressed)),
-        Err(error) if error.code() == OUTPUT_LIMIT_ERROR => Ok(None),
-        Err(error) => Err(encoder_error(error)),
-    }
+    with_thread_encoder(|encoder| {
+        set_up_encoder(encoder, channels, &file_channels, rgb, planar, image_size)
+            .and_then(|()| encoder.set_output_limit(codestream_limit))
+            .map_err(encoder_error)?;
+
+        let outcome = encode_samples(
+            encoder,
+            &mut compressed,
+            channels,
+            uncompressed,
+            &layout,
+            &file_channels,
+        )?;
+        match outcome {
+            Ok(()) => Ok(Some(compressed)),
+            Err(error) if error.code() == OUTPUT_LIMIT_ERROR => Ok(None),
+            Err(error) => Err(encoder_error(error)),
+        }
+    })
+}
+
+thread_local! {
+    /// The encoder of this thread, kept from one chunk to the next, as
+    /// `compress_image_section_to_le` has nowhere else to keep it. With the
+    /// image, tile and coding parameters of the last chunk, the encoder
+    /// reuses its tree of tiles, resolutions, subbands and code blocks and
+    /// their buffers instead of allocating them again.
+    static THREAD_ENCODER: Cell<Option<Encoder>> = const { Cell::new(None) };
+}
+
+/// Lends the encoder of this thread to the function, in the state of a new
+/// encoder. A thread keeps its encoder, and the memory of the last chunk it
+/// coded, until it exits.
+fn with_thread_encoder<T>(encode: impl FnOnce(&mut Encoder) -> T) -> T {
+    THREAD_ENCODER.with(|thread_encoder| {
+        let mut encoder = thread_encoder.take().unwrap_or_default();
+        encoder.reset();
+        let result = encode(&mut encoder);
+        thread_encoder.set(Some(encoder));
+        result
+    })
 }
 
 /// Codes the samples of a chunk with `encoder`, which is set up for it,
@@ -261,18 +286,19 @@ fn must_store_raw(channels: &ChannelList, chunk_lines: usize) -> bool {
     })
 }
 
-/// An encoder set up for one chunk with `ht_apply_impl`'s calls, in the
-/// same order: lossless (reversible, NLT type 3 on HALF and FLOAT
-/// channels), 128x32 code blocks, 5 decomposition levels, RPCL, a TLM marker
-/// and tile parts at each resolution, at image offset 0.
-fn new_encoder(
+/// Sets up `encoder`, in the state of a new encoder, for one chunk with
+/// `ht_apply_impl`'s calls, in the same order: lossless (reversible, NLT
+/// type 3 on HALF and FLOAT channels), 128x32 code blocks, 5 decomposition
+/// levels, RPCL, a TLM marker and tile parts at each resolution, at image
+/// offset 0.
+fn set_up_encoder(
+    encoder: &mut Encoder,
     channels: &ChannelList,
     file_channels: &[usize],
     rgb: bool,
     planar: bool,
     image_size: Point,
-) -> ::htj2k::Result<Encoder> {
-    let mut encoder = Encoder::new();
+) -> ::htj2k::Result<()> {
     encoder.set_version_comment(Some(OPENJPH_VERSION_COMMENT))?;
 
     // at most 65535 components, which `write_chunk_header` checks
@@ -316,7 +342,7 @@ fn new_encoder(
         encoder.access_siz_mut()?.set_component(component, sampling, bit_depth, is_float)?;
     }
 
-    Ok(encoder)
+    Ok(())
 }
 
 /// The codestream component order, `make_channel_map` in `OpenEXR`: the file

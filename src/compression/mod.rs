@@ -36,6 +36,8 @@ pub type Bytes<'s> = &'s [u8];
 /// borrows every buffer it needs from this value instead of allocating it.
 /// The buffers grow to fit the largest block decoded so far and are kept, so
 /// that decoding allocates nothing once a block of each size has been seen.
+/// The exception is HTJ2K, whose codestream decoder still allocates its own
+/// memory for every block.
 ///
 /// Create one with `DecodeScratch::default()`, which allocates nothing, and
 /// keep it for as long as blocks are being decoded: one per thread that
@@ -428,7 +430,8 @@ impl Compression {
     /// returns. It is an error if `decompressed_ne` is too short.
     ///
     /// All temporary memory is taken from `scratch`, so no memory is
-    /// allocated once the scratch has grown to fit the largest section.
+    /// allocated once the scratch has grown to fit the largest section,
+    /// except by HTJ2K, whose codestream decoder allocates for every section.
     pub fn decompress_image_section_from_le_into(
         self,
         header: &Header,

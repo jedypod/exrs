@@ -186,7 +186,8 @@ impl UncompressedBlock {
     /// It is an error if the destination is too short.
     ///
     /// No memory is allocated once `scratch` has grown to fit the largest
-    /// block, as all temporary memory is taken from it.
+    /// block, as all temporary memory is taken from it. The exception is
+    /// HTJ2K, whose codestream decoder allocates for every block.
     pub fn decompress_chunk_into(
         chunk: ChunkRef<'_>,
         meta_data: &MetaData,

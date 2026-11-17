@@ -1,7 +1,8 @@
 //! Decompressing a chunk into memory that the caller provides must produce
 //! the bytes that `UncompressedBlock::decompress_chunk` returns, must not
 //! allocate once its scratch is warm, and must refuse a destination that is
-//! too small and sizes that a damaged chunk claims.
+//! too small and sizes that a damaged chunk claims. HTJ2K, which still
+//! allocates for every chunk, is measured instead of asserted.
 //!
 //! A separate test binary, because it installs a global allocator that counts
 //! the allocations of each thread, and refuses any single allocation over

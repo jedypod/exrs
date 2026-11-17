@@ -713,6 +713,144 @@ fn subsampled_htj2k_decompresses_into_a_slice_like_to_a_vector() {
     assert_ne!(raw_count, 0);
 }
 
+/// The HTJ2K decoder keeps its memory in the scratch and reuses it for the
+/// next chunk of the same shape and coding. Decoding a sequence of chunks
+/// through one scratch must give what a new scratch gives for each chunk:
+/// chunks of different sizes, channels, sample types and planar coding in
+/// turn, chunks of one shape in a row, and damaged chunks, each followed by
+/// a valid one, of its own shape and of another.
+#[cfg(feature = "htj2k")]
+#[test]
+fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
+    use exr::meta::BlockDescription;
+    use SampleType::{F16, F32, U32};
+
+    let mut files: Vec<(MetaData, Vec<Chunk>)> =
+        htj2k_files().map(|(path, _)| read_chunks(&std::fs::read(path).unwrap())).collect();
+    let luma_chroma = [("BY", F16, 2, 2), ("RY", F16, 2, 2), ("Y", F16, 1, 1), ("id", U32, 2, 1)];
+    let planar = [("A", F32, 1, 1), ("Y", F16, 1, 2)];
+    for compression in [Compression::HTJ2K32, Compression::HTJ2K256] {
+        for channels in [&luma_chroma[..], &planar[..]] {
+            files.push(
+                Subsampled::new(channels, compression, BlockDescription::ScanLines).compress(),
+            );
+        }
+    }
+
+    let block_size = |meta_data: &MetaData, chunk: &Chunk| {
+        let block = UncompressedBlock::decompress_chunk(chunk.clone(), meta_data, false).unwrap();
+        block.data.len()
+    };
+    let is_coded = |meta_data: &MetaData, chunk: &Chunk| {
+        let compressed = chunk_ref(chunk).compressed_pixels_le;
+        compressed.starts_with(b"HT") && compressed.len() != block_size(meta_data, chunk)
+    };
+
+    // Each file's chunks in turn, so that most chunks follow a chunk of
+    // another file, then each file's chunks in a row, twice.
+    let mut sequence: Vec<(usize, Chunk)> = Vec::new();
+    let most_chunks = files.iter().map(|(_, chunks)| chunks.len()).max().unwrap();
+    for index in 0..most_chunks {
+        for (file, (_, chunks)) in files.iter().enumerate() {
+            if let Some(chunk) = chunks.get(index) {
+                sequence.push((file, chunk.clone()));
+            }
+        }
+    }
+    for (file, (_, chunks)) in files.iter().enumerate() {
+        for chunk in chunks.iter().chain(chunks) {
+            sequence.push((file, chunk.clone()));
+        }
+    }
+
+    // A damaged chunk, then the valid chunk it was made from, then the
+    // first chunk of the next file, for each file's first coded chunk.
+    let damages: [fn(&mut Vec<u8>); 4] = [
+        // the codestream ends in its tile parts
+        |bytes| bytes.truncate(bytes.len() * 2 / 3),
+        // the coded data of the tile parts is garbage
+        |bytes| {
+            let start = bytes.len() / 2;
+            bytes[start..].iter_mut().for_each(|byte| *byte ^= 0x5a);
+        },
+        // the codestream ends in its main header
+        |bytes| bytes.truncate(60),
+        // the end-of-codestream marker is missing
+        |bytes| {
+            bytes.pop();
+            bytes.pop();
+        },
+    ];
+    for (file, (meta_data, chunks)) in files.iter().enumerate() {
+        let chunk = chunks.iter().find(|chunk| is_coded(meta_data, chunk)).unwrap();
+        let next_file = (file + 1) % files.len();
+        for damage in damages {
+            let mut damaged = chunk.clone();
+            damage(compressed_pixels_mut(&mut damaged));
+            sequence.push((file, damaged));
+            sequence.push((file, chunk.clone()));
+            sequence.push((next_file, files[next_file].1[0].clone()));
+        }
+    }
+
+    let mut scratch = DecodeScratch::default();
+    let largest_block =
+        files.iter().map(|(meta_data, _)| meta_data.headers[0].max_block_byte_size());
+    let mut destination = vec![0_u8; largest_block.max().unwrap()];
+    let mut expected_destination = destination.clone();
+    let (mut decoded, mut failed) = (0, 0);
+
+    for (position, (file, chunk)) in sequence.iter().enumerate() {
+        let meta_data = &files[*file].0;
+        let name = format!("chunk {} of the sequence, from file {}", position, file);
+
+        destination.fill(0xa5);
+        expected_destination.fill(0xa5);
+        let result = UncompressedBlock::decompress_chunk_into(
+            chunk_ref(chunk),
+            meta_data,
+            false,
+            &mut scratch,
+            &mut destination,
+        );
+        let expected = UncompressedBlock::decompress_chunk_into(
+            chunk_ref(chunk),
+            meta_data,
+            false,
+            &mut DecodeScratch::default(),
+            &mut expected_destination,
+        );
+
+        match (result, expected) {
+            (Ok(index), Ok(expected_index)) => {
+                assert_eq!(index, expected_index, "{}", name);
+                let size = block_size(meta_data, chunk);
+                assert!(destination == expected_destination, "{}: different bytes", name);
+                assert!(
+                    destination[..size]
+                        == UncompressedBlock::decompress_chunk(chunk.clone(), meta_data, false)
+                            .unwrap()
+                            .data[..],
+                    "{}: different from decompressing to a vector",
+                    name
+                );
+                decoded += 1;
+            }
+            (Err(error), Err(expected_error)) => {
+                assert_eq!(error.to_string(), expected_error.to_string(), "{}", name);
+                failed += 1;
+            }
+            (result, expected) => {
+                panic!("{}: {:?} where a new scratch gives {:?}", name, result, expected)
+            }
+        }
+    }
+
+    // the damaged chunks the decoder notices must not disturb the next
+    assert_ne!(failed, 0);
+    assert!(decoded > failed);
+}
+
 /// HTJ2K cannot decompress without allocating: the codestream decoder of
 /// the `htj2k` crate keeps its memory in the scratch, but its headers still
 /// allocate a little for every codestream, and its buffers are allocated

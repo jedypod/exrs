@@ -939,6 +939,46 @@ mod test {
         }
     }
 
+    /// The encoder of a thread codes each chunk as a new encoder would, on
+    /// a new thread: after chunks of other shapes and channels, of its own
+    /// shape, after chunks it stopped at the size limit, and after an error.
+    #[test]
+    fn a_reused_encoder_codes_as_a_new_one() {
+        let chunks = [
+            noisy_chunk(H, 1, 40, 32, 0),
+            noisy_chunk(H, 1, 40, 32, 3),
+            noisy_chunk(F, 1, 37, 32, 32),
+            noisy_chunk(F, 1, 37, 32, 6),
+            noisy_chunk(H, 2, 64, 32, 8),
+            noisy_chunk(H, 1, 40, 32, 0),
+            noisy_chunk(F, 1, 1, 1, 0),
+            noisy_chunk(F, 1, 17, 7, 16),
+        ];
+        let refused = {
+            let mut channels = noisy_chunk(H, 1, 16, 32, 0).0;
+            channels.list[0].sampling = Vec2(1, 256);
+            // one line of 16 HALF samples
+            (channels, IntegerBounds::new(Vec2(0, 0), Vec2(16, 256)), vec![0_u8; 32])
+        };
+        let compress_chunk =
+            |(channels, rectangle, samples): &(ChannelList, IntegerBounds, Vec<u8>)| {
+                compress(channels, samples, *rectangle, 256).map_err(|error| error.to_string())
+            };
+        assert!(compress_chunk(&refused).unwrap_err().contains("HTJ2K encoder"));
+
+        let mut sequence = chunks.iter().chain([&refused]).chain(&chunks).collect::<Vec<_>>();
+        sequence.extend(chunks.iter().rev());
+        let mut stopped = 0;
+        for chunk in sequence {
+            let on_this_thread = compress_chunk(chunk);
+            let on_a_new_thread =
+                std::thread::scope(|scope| scope.spawn(|| compress_chunk(chunk)).join()).unwrap();
+            assert_eq!(on_this_thread, on_a_new_thread, "{:?}", chunk.1);
+            stopped += usize::from(matches!(on_this_thread, Ok(None)));
+        }
+        assert_ne!(stopped, 0);
+    }
+
     #[test]
     fn chunk_header_round_trip() {
         let mut chunk = Vec::new();

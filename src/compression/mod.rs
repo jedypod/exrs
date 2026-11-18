@@ -38,10 +38,10 @@ pub type Bytes<'s> = &'s [u8];
 /// borrows every buffer it needs from this value instead of allocating it.
 /// The buffers grow to fit the largest block decoded so far and are kept, so
 /// that decoding allocates nothing once a block of each size has been seen.
-/// The exception is HTJ2K: its codestream decoder keeps its memory here too,
-/// but still makes a few small allocations for every block, and allocates
-/// its memory again when a block differs in shape or coding from the one
-/// before.
+/// The exception is HTJ2K, lossless or lossy (`LJ2K`): its codestream
+/// decoder keeps its memory here too, but still makes a few small
+/// allocations for every block, and allocates its memory again when a block
+/// differs in shape or coding from the one before.
 ///
 /// Create one with `DecodeScratch::default()`, which allocates nothing, and
 /// keep it for as long as blocks are being decoded: one per thread that
@@ -286,6 +286,13 @@ pub enum Compression {
     /// gives `None`. A quality that is not finite or not within 1 to 150 is
     /// an error when writing.
     ///
+    /// The `LJ2K` files of every `OpenEXR` version are read: those of 3.5.2
+    /// and later (tested with 3.5.3), and those of 3.5.0 and 3.5.1, which
+    /// apply the transfer function outside the codestream and which are
+    /// decoded as later versions of `OpenEXR` decode them (tested with
+    /// 3.5.1). exrs writes the chunks of 3.5.2 and later, which 3.5.0 and
+    /// 3.5.1 cannot read.
+    ///
     /// Needs the `htj2k` cargo feature, without which reading and writing
     /// return `Error::NotSupported`.
     LJ2K(Option<f32>),
@@ -524,9 +531,9 @@ impl Compression {
     ///
     /// All temporary memory is taken from `scratch`, so no memory is
     /// allocated once the scratch has grown to fit the largest section,
-    /// except by HTJ2K, whose codestream decoder makes a few allocations
-    /// for every section, and more when the section differs in shape or
-    /// coding from the one before.
+    /// except by HTJ2K (`HTJ2K32`, `HTJ2K256` and `LJ2K`), whose codestream
+    /// decoder makes a few allocations for every section, and more when the
+    /// section differs in shape or coding from the one before.
     pub fn decompress_image_section_from_le_into(
         self,
         header: &Header,

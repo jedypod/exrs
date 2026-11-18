@@ -611,11 +611,11 @@ impl Compression {
                 decompressed_ne,
             ),
             #[cfg(feature = "htj2k")]
-            HTJ2K32 | HTJ2K256 => htj2k::decompress_into(
+            HTJ2K32 | HTJ2K256 | LJ2K(_) => htj2k::decompress_into(
                 channels,
                 compressed_le,
                 pixel_section,
-                pedantic,
+                matches!(self, LJ2K(_)),
                 &mut scratch.htj2k,
                 decompressed_ne,
             ),
@@ -625,8 +625,6 @@ impl Compression {
                     "HTJ2K decompression (enable the `htj2k` feature of the exr crate)",
                 ))
             }
-            #[cfg(feature = "htj2k")]
-            LJ2K(_) => return Err(Error::unsupported("LJ2K decompression")),
             #[cfg(not(feature = "htj2k"))]
             LJ2K(_) => {
                 return Err(Error::unsupported(

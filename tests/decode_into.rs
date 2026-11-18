@@ -1,8 +1,9 @@
 //! Decompressing a chunk into memory that the caller provides must produce
 //! the bytes that `UncompressedBlock::decompress_chunk` returns, must not
 //! allocate once its scratch is warm, and must refuse a destination that is
-//! too small and sizes that a damaged chunk claims. HTJ2K, which still
-//! makes a few allocations for every chunk, is measured instead of asserted.
+//! too small and sizes that a damaged chunk claims. HTJ2K (lossless, and
+//! lossy as `LJ2K`), which still makes a few allocations for every chunk, is
+//! measured instead of asserted.
 //!
 //! A separate test binary, because it installs a global allocator that counts
 //! the allocations of each thread, and refuses any single allocation over
@@ -495,6 +496,124 @@ fn htj2k_decompresses_into_a_slice_like_the_uncompressed_file() {
     }
 }
 
+/// The files that OpenEXR wrote with LJ2K, 3.5.3's and the legacy ones of
+/// 3.5.1, without OpenEXR's decodings of them. See `tests/lj2k.rs`.
+#[cfg(feature = "htj2k")]
+fn lj2k_files() -> Vec<PathBuf> {
+    let directory = Path::new("tests/images/valid/custom/htj2k");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            (name.contains("_lj2k_q") || name.contains("_lj2k351_q"))
+                && !name.ends_with("_decoded.exr")
+        })
+        .collect();
+    files.sort();
+    assert!(files.len() >= 18 + 14, "LJ2K files missing: {:?}", files);
+    files
+}
+
+/// LJ2K files that exrs writes: the image of `write_image`, whose R, G and B
+/// halves LJ2K codes lossily and the rest losslessly, in scan lines and in
+/// tiles, at qualities of each class.
+#[cfg(feature = "htj2k")]
+fn lj2k_written_files() -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    for quality in [Some(1.0), Some(96.0), None, Some(150.0)] {
+        for blocks in ALL_BLOCKS {
+            let bytes = write_image(Compression::LJ2K(quality), blocks, Vec2(71, 277));
+            files.push((format!("exrs LJ2K {:?} {:?}", quality, blocks), bytes));
+        }
+    }
+    files
+}
+
+/// Whether a coded LJ2K chunk is padded, which only lossy chunks are.
+#[cfg(feature = "htj2k")]
+fn is_padded(compressed: &[u8]) -> bool {
+    let comment = b"OpenEXR LJ2K padding: ";
+    compressed.windows(comment.len()).any(|window| window == comment)
+}
+
+/// LJ2K decodes through the HTJ2K decoder, with its memory in the scratch,
+/// and drops the lines and columns that pad a lossy chunk. Decompressing
+/// into a slice must give what decompressing to a vector gives, and write
+/// nothing past the block, for OpenEXR's LJ2K files and exrs's, through one
+/// scratch, also after chunks of other files and in reverse order. The
+/// legacy chunks of OpenEXR 3.5.1 ("HT"), whose lossy samples go through
+/// the legacy transfer function on the way into the slice, are among them.
+#[cfg(feature = "htj2k")]
+#[test]
+fn lj2k_decompresses_into_a_slice_like_to_a_vector() {
+    let mut files: Vec<(String, Vec<u8>)> = lj2k_files()
+        .into_iter()
+        .map(|path| (path.display().to_string(), std::fs::read(&path).unwrap()))
+        .collect();
+    files.extend(lj2k_written_files());
+
+    let mut scratch = DecodeScratch::default();
+    let mut destination = Vec::new();
+    let (mut lossy, mut lossless, mut raw, mut legacy) = (0, 0, 0, 0);
+
+    for (name, bytes) in &files {
+        let (meta_data, chunks) = read_chunks(bytes);
+        let header = &meta_data.headers[0];
+        assert!(matches!(header.compression, Compression::LJ2K(_)), "{}", name);
+        destination.resize(header.max_block_byte_size(), 0);
+
+        for chunk in chunks.iter().chain(chunks.iter().rev()) {
+            let expected = UncompressedBlock::decompress_chunk(chunk.clone(), &meta_data, true)
+                .unwrap_or_else(|error| panic!("{}: {}", name, error));
+
+            // make sure that every byte is written
+            destination.fill(0xa5);
+
+            let index = UncompressedBlock::decompress_chunk_into(
+                chunk_ref(chunk),
+                &meta_data,
+                true,
+                &mut scratch,
+                &mut destination,
+            )
+            .unwrap_or_else(|error| panic!("{}: {}", name, error));
+
+            let size = expected.data.len();
+            assert_eq!(index, expected.index, "{}", name);
+            assert!(destination[..size] == expected.data[..], "{}: {:?}", name, index);
+            assert!(
+                destination[size..].iter().all(|&byte| byte == 0xa5),
+                "{}: wrote past the block",
+                name
+            );
+
+            let compressed = chunk_ref(chunk).compressed_pixels_le;
+            if compressed.len() == size {
+                raw += 1;
+            } else {
+                if compressed.starts_with(b"HT") && name.contains("_lj2k351_q") {
+                    legacy += 1;
+                } else {
+                    assert!(compressed.starts_with(b"HL"), "{}: {:?}", name, index);
+                }
+                if is_padded(compressed) {
+                    lossy += 1;
+                } else {
+                    lossless += 1;
+                }
+            }
+        }
+    }
+
+    // padded lossy chunks, chunks coded without padding, raw ones, and
+    // legacy ones
+    assert_ne!(lossy, 0);
+    assert_ne!(lossless, 0);
+    assert_ne!(raw, 0);
+    assert_ne!(legacy, 0);
+}
+
 /// A layer with subsampled channels, which exrs cannot write through the
 /// image API, as a header and the native-endian samples of each block in
 /// the layout OpenEXR packs them: line by line, and on each line only the
@@ -717,8 +836,9 @@ fn subsampled_htj2k_decompresses_into_a_slice_like_to_a_vector() {
 /// next chunk of the same shape and coding. Decoding a sequence of chunks
 /// through one scratch must give what a new scratch gives for each chunk:
 /// chunks of different sizes, channels, sample types and planar coding in
-/// turn, chunks of one shape in a row, and damaged chunks, each followed by
-/// a valid one, of its own shape and of another.
+/// turn, lossless and lossy (`LJ2K`, padded or not) in turn, chunks of one
+/// shape in a row, and damaged chunks, each followed by a valid one, of its
+/// own shape and of another.
 #[cfg(feature = "htj2k")]
 #[test]
 fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
@@ -727,6 +847,8 @@ fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
 
     let mut files: Vec<(MetaData, Vec<Chunk>)> =
         htj2k_files().map(|(path, _)| read_chunks(&std::fs::read(path).unwrap())).collect();
+    files.extend(lj2k_files().iter().map(|path| read_chunks(&std::fs::read(path).unwrap())));
+    files.extend(lj2k_written_files().iter().map(|(_, bytes)| read_chunks(bytes)));
     let luma_chroma = [("BY", F16, 2, 2), ("RY", F16, 2, 2), ("Y", F16, 1, 1), ("id", U32, 2, 1)];
     let planar = [("A", F32, 1, 1), ("Y", F16, 1, 2)];
     for compression in [Compression::HTJ2K32, Compression::HTJ2K256] {
@@ -743,7 +865,8 @@ fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
     };
     let is_coded = |meta_data: &MetaData, chunk: &Chunk| {
         let compressed = chunk_ref(chunk).compressed_pixels_le;
-        compressed.starts_with(b"HT") && compressed.len() != block_size(meta_data, chunk)
+        (compressed.starts_with(b"HT") || compressed.starts_with(b"HL"))
+            && compressed.len() != block_size(meta_data, chunk)
     };
 
     // Each file's chunks in turn, so that most chunks follow a chunk of
@@ -764,7 +887,8 @@ fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
     }
 
     // A damaged chunk, then the valid chunk it was made from, then the
-    // first chunk of the next file, for each file's first coded chunk.
+    // first chunk of the next file, for each file's first coded chunk (an
+    // LJ2K file may have none, where every chunk is stored raw).
     let damages: [fn(&mut Vec<u8>); 4] = [
         // the codestream ends in its tile parts
         |bytes| bytes.truncate(bytes.len() * 2 / 3),
@@ -782,7 +906,9 @@ fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
         },
     ];
     for (file, (meta_data, chunks)) in files.iter().enumerate() {
-        let chunk = chunks.iter().find(|chunk| is_coded(meta_data, chunk)).unwrap();
+        let Some(chunk) = chunks.iter().find(|chunk| is_coded(meta_data, chunk)) else {
+            continue;
+        };
         let next_file = (file + 1) % files.len();
         for damage in damages {
             let mut damaged = chunk.clone();
@@ -856,8 +982,11 @@ fn htj2k_chunks_decompress_through_one_scratch_like_through_new_ones() {
 /// allocate a little for every codestream, and its buffers are allocated
 /// again for a codestream of a new shape. This prints how much, measured
 /// like `decompressing_into_a_slice_does_not_allocate` does: a second pass
-/// over all chunks, with a warm scratch. Run it with
-/// `cargo test --test decode_into -- --ignored --nocapture`.
+/// over all chunks, with a warm scratch. LJ2K is measured as well: OpenEXR's
+/// files, and one wide image that exrs writes with `HTJ2K256` and with
+/// `LJ2K`, so that the two compare chunk for chunk. Run it with
+/// `cargo test --release --features htj2k --test decode_into -- --ignored
+/// --nocapture`.
 #[cfg(feature = "htj2k")]
 #[test]
 #[ignore = "a measurement, not a requirement"]
@@ -871,8 +1000,23 @@ fn htj2k_allocations_per_chunk() {
             .map(move |method| directory.join(sample_type).join(format!("{method}.exr")))
     });
 
-    for path in htj2k_files().map(|(path, _)| path).chain(wide_files) {
-        let bytes = std::fs::read(&path).unwrap();
+    let mut files: Vec<(String, Vec<u8>)> = htj2k_files()
+        .map(|(path, _)| path)
+        .chain(wide_files)
+        .chain(lj2k_files())
+        .map(|path| {
+            let name = path.strip_prefix("tests/images/valid/custom").unwrap().display();
+            (name.to_string(), std::fs::read(&path).unwrap())
+        })
+        .collect();
+    for compression in
+        [Compression::HTJ2K256, Compression::LJ2K(None), Compression::LJ2K(Some(150.0))]
+    {
+        let bytes = write_image(compression, Blocks::ScanLines, Vec2(1920, 1024));
+        files.push((format!("exrs {} 1920x1024", compression), bytes));
+    }
+
+    for (name, bytes) in files {
         let (meta_data, chunks) = read_chunks(&bytes);
         let header = &meta_data.headers[0];
 
@@ -909,7 +1053,11 @@ fn htj2k_allocations_per_chunk() {
             .iter()
             .filter(|chunk| chunk_ref(chunk).compressed_pixels_le.len() != block_size(chunk))
             .count();
-        assert_ne!(compressed_chunk_count, 0);
+        if compressed_chunk_count == 0 {
+            // some LJ2K files store every chunk raw
+            println!("{}: every chunk is stored raw", name);
+            continue;
+        }
 
         // The decoder reuses its memory for a chunk of the shape of the one
         // before, and allocates it again for a chunk of another shape, such
@@ -962,7 +1110,7 @@ fn htj2k_allocations_per_chunk() {
             "{}: {} channels, {} of {} chunks compressed, {:?} pixels per block: \
              {} allocations and {} KiB per compressed chunk; \
              after a chunk of the same shape {}, of another shape {}",
-            path.strip_prefix("tests/images/valid/custom").unwrap().display(),
+            name,
             header.channels.list.len(),
             compressed_chunk_count,
             chunks.len(),
@@ -973,6 +1121,90 @@ fn htj2k_allocations_per_chunk() {
             average(rebuilt),
         );
     }
+}
+
+/// Where HTJ2K allocates when decompressing into a slice, it is the
+/// codestream decoder of the `htj2k` crate that does: with a warm scratch,
+/// each chunk makes exactly the allocations that the decoder makes for its
+/// codestream alone, with its memory kept from the chunk before. So exrs
+/// adds none, for lossless chunks and for lossy `LJ2K` ones, padded or not,
+/// whose headers make the decoder allocate more than HTJ2K's (it reads the
+/// NLT tables of each lossy component into new memory for every
+/// codestream), and for the legacy `LJ2K` chunks of `OpenEXR` 3.5.1, whose
+/// lossy samples exrs maps through the legacy transfer function in place.
+/// The chunks are those of one wide image that exrs writes with each
+/// method, and OpenEXR's LJ2K files, 3.5.3's and 3.5.1's.
+#[cfg(feature = "htj2k")]
+#[test]
+fn htj2k_allocates_only_in_the_codestream_decoder() {
+    let mut files: Vec<(String, Vec<u8>)> = lj2k_files()
+        .into_iter()
+        .map(|path| (path.display().to_string(), std::fs::read(&path).unwrap()))
+        .collect();
+    for compression in [Compression::HTJ2K32, Compression::HTJ2K256, Compression::LJ2K(None)] {
+        let bytes = write_image(compression, Blocks::ScanLines, Vec2(1920, 512));
+        files.push((format!("exrs {}", compression), bytes));
+    }
+
+    let (mut lossy_chunks, mut legacy_lossy_chunks) = (0, 0);
+    for (name, bytes) in files {
+        let (meta_data, chunks) = read_chunks(&bytes);
+        let header = &meta_data.headers[0];
+        // the codestream decoder is used as `htj2k::decompress_into` uses it,
+        // which these chunks, none of them subsampled, decode lines of
+        assert!(header.channels.list.iter().all(|channel| channel.sampling == Vec2(1, 1)));
+
+        let mut scratch = DecodeScratch::default();
+        let mut destination = vec![0_u8; header.max_block_byte_size()];
+        let mut memory = htj2k::codestream::DecoderMemory::default();
+
+        // the first pass warms up the scratch and the memory
+        for pass in 0..2 {
+            for (index, chunk) in chunks.iter().enumerate() {
+                let compressed = chunk_ref(chunk).compressed_pixels_le;
+                if !(compressed.starts_with(b"HT") || compressed.starts_with(b"HL")) {
+                    continue;
+                }
+
+                let into_a_slice = count_allocations(|| {
+                    UncompressedBlock::decompress_chunk_into(
+                        chunk_ref(chunk),
+                        &meta_data,
+                        false,
+                        &mut scratch,
+                        &mut destination,
+                    )
+                    .unwrap();
+                });
+
+                // the codestream starts after the payload of the chunk header
+                let payload = u32::from_be_bytes(compressed[2..6].try_into().unwrap());
+                let codestream = &compressed[6 + payload as usize..];
+                let alone = count_allocations(|| {
+                    let mut decoder =
+                        htj2k::codestream::Codestream::with_memory(std::mem::take(&mut memory));
+                    decoder.set_memory_limit(u64::MAX);
+                    decoder.read_headers(codestream).unwrap();
+                    decoder.set_planar(false);
+                    decoder.create().unwrap();
+                    while decoder.pull().unwrap().is_some() {}
+                    memory = decoder.into_memory();
+                });
+
+                if pass == 1 {
+                    assert_eq!(into_a_slice, alone, "{}: chunk {}", name, index);
+                    lossy_chunks += usize::from(is_padded(compressed));
+                    legacy_lossy_chunks += usize::from(
+                        name.contains("_lj2k351_q")
+                            && is_padded(compressed)
+                            && compressed.starts_with(b"HT"),
+                    );
+                }
+            }
+        }
+    }
+    assert_ne!(lossy_chunks, 0);
+    assert_ne!(legacy_lossy_chunks, 0);
 }
 
 /// The header of a DWA chunk states the size of each of its sections. Without

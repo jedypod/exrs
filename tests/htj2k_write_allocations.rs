@@ -1,6 +1,8 @@
 //! Measures what compressing a chunk with HTJ2K allocates and how long it
 //! takes, for chunks that HTJ2K codes and for chunks of noise, which it
-//! cannot make smaller and which are then stored raw.
+//! cannot make smaller and which are then stored raw. `LJ2K` is measured as
+//! well: it codes the R, G and B halves of the RGBA images lossily, padded
+//! to 1 modulo 32 each way, and the Y floats losslessly.
 //!
 //! A separate test binary, because it installs a global allocator that
 //! counts the allocations of each thread. Run it with
@@ -134,7 +136,12 @@ fn htj2k_compression_allocations_per_chunk() {
     ];
 
     for (name, channels, size, blocks, noise) in cases {
-        for compression in [Compression::HTJ2K32, Compression::HTJ2K256] {
+        for compression in [
+            Compression::HTJ2K32,
+            Compression::HTJ2K256,
+            Compression::LJ2K(None),
+            Compression::LJ2K(Some(150.0)),
+        ] {
             let header = Header::new("measured".into(), size, channels.clone()).with_encoding(
                 compression,
                 blocks,

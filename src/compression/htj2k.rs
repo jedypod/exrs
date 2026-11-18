@@ -1384,6 +1384,33 @@ mod test {
         (channels, rectangle, samples)
     }
 
+    /// Channels `B`, `G` and `R` of `sample_type`, an R, G and B triplet that
+    /// `LJ2K` codes lossily, and with `alpha` an `A` of the same type, which
+    /// it codes losslessly: `width` x `height` at the origin, and their
+    /// native-endian samples, made as by [`noisy_chunk`].
+    fn noisy_rgb_chunk(
+        sample_type: SampleType,
+        alpha: bool,
+        width: usize,
+        height: usize,
+        noise_bits: u32,
+    ) -> (ChannelList, IntegerBounds, Vec<u8>) {
+        let names: &[&str] = if alpha {
+            &["A", "B", "G", "R"]
+        } else {
+            &["B", "G", "R"]
+        };
+        let channel = |name: &&str| ChannelDescription {
+            name: (*name).into(),
+            sample_type,
+            quantize_linearly: false,
+            sampling: Vec2(1, 1),
+        };
+        let channels = ChannelList::new(names.iter().map(channel).collect());
+        let (_, _, samples) = noisy_chunk(sample_type, 1, width * names.len(), height, noise_bits);
+        (channels, IntegerBounds::new(Vec2(0, 0), Vec2(width, height)), samples)
+    }
+
     /// The chunk coded without a size limit.
     fn coded_without_limit(
         channels: &ChannelList,
@@ -1511,6 +1538,126 @@ mod test {
             stopped += usize::from(matches!(on_this_thread, Ok(None)));
         }
         assert_ne!(stopped, 0);
+    }
+
+    /// Whether a coded chunk is an `LJ2K` codestream padded by `compress`.
+    fn is_padded(chunk: &[u8]) -> bool {
+        let comment = b"OpenEXR LJ2K padding: ";
+        chunk.windows(comment.len()).any(|window| window == comment)
+    }
+
+    /// The output limit with `LJ2K`, as
+    /// `a_coded_chunk_fits_a_limit_of_its_size_exactly` for HTJ2K: lossy chunks
+    /// padded each way, lossy HALF and FLOAT at qualities below 97 and above,
+    /// with and without a lossless channel beside the triplet, one that needs
+    /// no padding, and one that `LJ2K` codes losslessly. The limit is the size
+    /// of the chunk's samples, not of the padded image, so it stops a padded
+    /// chunk as it stops another.
+    #[test]
+    fn an_lj2k_chunk_fits_a_limit_of_its_size_exactly() {
+        // (chunk, quality, padded)
+        let chunks = [
+            (noisy_rgb_chunk(H, true, 40, 32, 0), 110.0, true),
+            (noisy_rgb_chunk(F, false, 61, 5, 12), 50.0, true),
+            (noisy_rgb_chunk(F, true, 30, 2, 20), 150.0, true),
+            (noisy_rgb_chunk(H, false, 33, 33, 8), 97.0, false),
+            (noisy_chunk(H, 1, 40, 32, 8), 110.0, false),
+        ];
+        for ((channels, rectangle, samples), quality, padded) in chunks {
+            let within = |max_size| {
+                compress_within(&channels, &samples, rectangle, 256, Some(quality), max_size)
+                    .unwrap()
+            };
+            let coded = within(usize::MAX).unwrap();
+            assert!(coded.starts_with(b"HL"), "{:?}", rectangle);
+            assert_eq!(is_padded(&coded), padded, "{rectangle:?}");
+            let size = coded.len();
+            assert_eq!(within(size), Some(coded), "{rectangle:?}");
+            assert_eq!(within(size - 1), None, "{rectangle:?}");
+            assert_eq!(within(10), None);
+            assert_eq!(within(0), None);
+        }
+    }
+
+    /// `compress` keeps a coded `LJ2K` chunk only if it is smaller than the
+    /// samples, as for HTJ2K: padded lossy chunks whose coded size is the
+    /// size of the (unpadded) samples less one byte, the same, and one byte
+    /// more. The first assertions check that each chunk still lands there.
+    #[test]
+    fn an_lj2k_chunk_is_kept_only_if_smaller_than_the_samples() {
+        // (sample type, quality, noise bits, width, height, coded size less
+        // the size of the samples)
+        let cases = [
+            (F, 110.0, 18, 61, 5, -1),
+            (F, 150.0, 9, 10, 32, -1),
+            (H, 110.0, 22, 27, 31, 0),
+            (F, 110.0, 23, 25, 16, 0),
+            (H, 110.0, 17, 68, 9, 1),
+            (F, 50.0, 31, 11, 31, 1),
+        ];
+        for (sample_type, quality, noise_bits, width, height, difference) in cases {
+            let (channels, rectangle, samples) =
+                noisy_rgb_chunk(sample_type, false, width, height, noise_bits);
+            let coded =
+                compress_within(&channels, &samples, rectangle, 256, Some(quality), usize::MAX)
+                    .unwrap()
+                    .unwrap();
+            assert!(is_padded(&coded), "{:?}", rectangle);
+            let expected_size = samples.len().checked_add_signed(difference);
+            assert_eq!(Some(coded.len()), expected_size, "{rectangle:?}");
+
+            let expected = (difference < 0).then_some(coded);
+            let kept = compress(&channels, &samples, rectangle, 256, Some(quality)).unwrap();
+            assert_eq!(kept, expected, "{rectangle:?}");
+        }
+    }
+
+    /// The encoder of a thread codes `LJ2K` chunks as a new encoder would,
+    /// among HTJ2K chunks and lossy chunks of other qualities, sample types
+    /// and sizes, after chunks it stopped at the size limit, and after a
+    /// FLOAT chunk past half's range, whose NLT table is built for it: the
+    /// irreversible coding, the quantisation, the NLT tables and the padding
+    /// of one chunk must not carry over to the next.
+    #[test]
+    fn a_reused_encoder_codes_lj2k_as_a_new_one() {
+        let hdr = {
+            let (channels, rectangle, mut samples) = noisy_rgb_chunk(F, false, 20, 9, 4);
+            samples[..4].copy_from_slice(&1.0e6_f32.to_ne_bytes());
+            (channels, rectangle, samples)
+        };
+        let chunks = [
+            (noisy_rgb_chunk(H, true, 40, 32, 0), Some(110.0)),
+            (noisy_rgb_chunk(F, false, 61, 5, 12), Some(50.0)),
+            (hdr, Some(150.0)),
+            (noisy_chunk(H, 1, 40, 32, 0), None),
+            (noisy_rgb_chunk(H, true, 40, 32, 0), Some(97.0)),
+            (noisy_rgb_chunk(F, false, 61, 5, 12), Some(50.0)),
+            (noisy_rgb_chunk(F, false, 20, 9, 4), Some(150.0)),
+            (noisy_chunk(F, 1, 37, 32, 32), Some(110.0)),
+            (noisy_rgb_chunk(H, false, 68, 9, 17), Some(110.0)),
+            (noisy_rgb_chunk(H, true, 33, 33, 8), Some(1.0)),
+        ];
+        let compress_chunk = |((channels, rectangle, samples), quality): &(
+            (ChannelList, IntegerBounds, Vec<u8>),
+            Option<f32>,
+        )| {
+            compress(channels, samples, *rectangle, 256, *quality)
+                .map_err(|error| error.to_string())
+        };
+
+        let mut sequence = chunks.iter().chain(&chunks).collect::<Vec<_>>();
+        sequence.extend(chunks.iter().rev());
+        let (mut stopped, mut padded) = (0, 0);
+        for chunk in sequence {
+            let on_this_thread = compress_chunk(chunk);
+            let on_a_new_thread =
+                std::thread::scope(|scope| scope.spawn(|| compress_chunk(chunk)).join()).unwrap();
+            assert_eq!(on_this_thread, on_a_new_thread, "{:?} {:?}", (chunk.0).1, chunk.1);
+            stopped += usize::from(matches!(on_this_thread, Ok(None)));
+            padded += usize::from(matches!(&on_this_thread, Ok(Some(coded)) if is_padded(coded)));
+        }
+        assert_ne!(stopped, 0);
+        assert_ne!(padded, 0);
     }
 
     #[test]

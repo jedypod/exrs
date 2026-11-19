@@ -33,7 +33,7 @@ bit_field = "^0.10.1"          # exr file version bit flags
 zlib-rs = { version = "^0.6.0", default-features = false, features = ["std"] }  # zip compression and decompression, into memory of the caller
 smallvec = "^1.7.0"            # make cache-friendly allocations        TODO profile if smallvec is really an improvement!
 rayon-core = { version = "^1.11.0", optional = true }         # threading for parallel compression
-htj2k = { git = "https://github.com/jedypod/htj2k.git", rev = "2431a0f4213771064ba8df1b746fab2dfa9a5a91", optional = true, default-features = false }  # HTJ2K codestream coding, ported from OpenJPH
+htj2k = { version = "0.1", optional = true, default-features = false }  # HTJ2K codestream coding, ported from OpenJPH
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 multiversion = "0.9.2" # runtime AVX2 selection for better performance on x86
